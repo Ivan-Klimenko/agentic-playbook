@@ -68,6 +68,7 @@ Why this works:
 - Set `recursion_limit` per graph. A runaway ReAct loop is the most common failure mode.
 - Provide fallback paths: if a specialized approach fails (e.g., `create_react_tunnel`), fall back to a manual ReAct with `ToolNode`.
 - Stub/circuit-breaker: check external service health before entering the main agent loop. Short-circuit with a canned response when the backend is down.
+- **Error messages for LLM consumption**: design tool error strings with actionable information (valid options, what went wrong, how to retry). The LLM is the consumer, not a human.
 
 ### 2.5 Dynamic Prompt Injection
 
@@ -95,11 +96,210 @@ Not every request needs the full agent loop. Add a lightweight pre-processing no
 
 This saves latency and tokens for predictable inputs.
 
+### 2.7 Two-Tier Model Strategy
+
+Use different models for different cognitive loads within the same agent pipeline:
+
+- **Expensive model** (Claude Sonnet/Opus) — reasoning, planning, orchestration, tool selection
+- **Cheap model** (GPT-4o-mini, Haiku) — summarization, extraction, classification, formatting
+
+Typical application: a search tool fetches web content, a cheap model summarizes it into a structured result (Pydantic schema), and the expensive model reasons over the summaries.
+
+**Why it works:** Summarization doesn't need frontier-model reasoning — it's a compression task. Routing it to a cheap model saves tokens on the main agent's context window while keeping the pipeline fast.
+
 ---
 
-## 3. LangGraph Patterns (Snippets)
+## 3. Context Engineering
 
-### 3.1 State with Reducers and Output Schema
+As agent tasks grow longer (~50+ tool calls), **context rot** becomes the primary failure mode: the LLM's attention degrades with distance from the current position, causing mission drift, forgotten objectives, and information loss across multi-agent handoffs ("game of telephone"). These patterns address context management as a first-class concern.
+
+### 3.1 TODO Lists as Context Anchors
+
+A TODO tool that the agent continuously rewrites to combat context rot. Inspired by Claude Code's `TodoWrite` and Manus.
+
+**Core insight**: forcing the LLM to rewrite the full TODO list acts as self-prompting — it recites its objectives at the end of the context, re-anchoring attention.
+
+**Design decisions:**
+- **Full overwrite, not append**: the LLM rewrites the entire list each time, allowing it to reprioritize and prune. No custom reducer — each update replaces the list.
+- **One `in_progress` at a time**: prevents the agent from losing focus across concurrent tasks.
+- **Write-read-reflect cycle**: after completing a task, read the TODO back, reflect on progress, then update.
+
+```python
+class Todo(TypedDict):
+    content: str
+    status: Literal["pending", "in_progress", "completed"]
+
+class DeepAgentState(AgentState):
+    todos: NotRequired[list[Todo]]  # absent in initial state, no mandatory init
+
+@tool(description=WRITE_TODOS_DESCRIPTION, parse_docstring=True)
+def write_todos(
+    todos: list[Todo],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> Command:
+    """Create or update the full TODO list.
+
+    Args:
+        todos: Complete list of all tasks with their statuses.
+    """
+    return Command(update={
+        "todos": todos,
+        "messages": [ToolMessage(f"Updated todo list to {todos}", tool_call_id=tool_call_id)],
+    })
+```
+
+**Prompt workflow** (instruct the agent):
+1. Create TODO at the start of every task
+2. After completing a TODO, call `read_todos` to remind yourself
+3. Reflect on what you've done and what's next
+4. Mark task completed, set next task to `in_progress`
+5. Batch research tasks into a single TODO to reduce overhead
+
+### 3.2 Virtual Filesystem for Context Offloading
+
+A `dict[str, str]` backed virtual filesystem stored in agent state. Agents write token-heavy content (search results, analysis drafts, collected data) to files and keep only lightweight summaries in messages.
+
+**Why virtual, not real files:**
+- Enables backtracking and restoring via checkpointing — impossible with real disk I/O
+- Thread-scoped persistence: files live for the duration of a conversation, not beyond
+- No filesystem permissions, sandboxing, or cleanup concerns
+
+```python
+def file_reducer(left: dict | None, right: dict | None) -> dict:
+    """Merge-dict reducer: new values overwrite existing keys, other keys preserved."""
+    if left is None: return right
+    if right is None: return left
+    return {**left, **right}
+
+class DeepAgentState(AgentState):
+    files: Annotated[NotRequired[dict[str, str]], file_reducer]
+```
+
+**Tool suite**: `ls`, `read_file` (with offset/limit pagination, `cat -n` line numbers, 2000-char line truncation), `write_file`, `edit_file` (exact string matching).
+
+**Key**: `write_file` returns only a confirmation in the `ToolMessage`, NOT the file content. Heavy content goes to state; lightweight acknowledgment goes to messages:
+
+```python
+@tool
+def write_file(
+    file_path: str, content: str,
+    state: Annotated[DeepAgentState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+) -> Command:
+    files = state.get("files", {})
+    files[file_path] = content
+    return Command(update={
+        "files": files,
+        "messages": [ToolMessage(f"Updated file {file_path}", tool_call_id=tool_call_id)],
+    })
+```
+
+### 3.3 The Orient-Save-Read Workflow
+
+A concrete workflow pattern for agents that need to gather, store, and process information:
+
+1. **Orient**: call `ls()` to see what files already exist before starting work
+2. **Save**: write collected content (user request, search results, intermediate analysis) to files immediately — before context compression can eliminate it
+3. **Read**: when ready to produce output, `read_file` the stored content for precise reference
+
+**Why save early**: for long-running agents, context content can be compressed or dropped by the runtime. Storing information in files before this happens and retrieving when needed is proactive context engineering.
+
+### 3.4 Context Isolation via Sub-Agents
+
+Sub-agents receive a **completely fresh context** containing only their task description. This prevents context clash, confusion, and poisoning from the parent's conversation history.
+
+**The critical line**: replace messages entirely before invoking the sub-agent:
+
+```python
+@tool
+def task(
+    description: str,
+    subagent_type: str,
+    state: Annotated[DeepAgentState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+):
+    sub_agent = agents[subagent_type]
+    # Fresh context — sub-agent sees ONLY the task description
+    state["messages"] = [{"role": "user", "content": description}]
+    result = sub_agent.invoke(state)
+    return Command(update={
+        "files": result.get("files", {}),  # Merge file changes back
+        "messages": [ToolMessage(result["messages"][-1].content, tool_call_id=tool_call_id)],
+    })
+```
+
+**Shared state, isolated messages**: the `files` dict is shared (merged back via `file_reducer`), enabling file-based inter-agent communication. But `messages` are replaced, so each sub-agent starts with a clean context. Sub-agents can't see each other's work — provide complete standalone instructions.
+
+### 3.5 Content Summarization Pipeline
+
+When a tool fetches external content (web search, API call), summarize it before it enters the agent's context:
+
+```
+Search query → HTTP fetch → HTML-to-markdown → Structured summarize (cheap model)
+  → UUID filename → Write to virtual file → Return minimal summary to agent
+```
+
+```python
+class Summary(BaseModel):
+    filename: str = Field(description="Name of the file to store.")
+    summary: str = Field(description="Key learnings from the webpage.")
+
+@tool
+def tavily_search(
+    query: str,
+    state: Annotated[DeepAgentState, InjectedState],
+    tool_call_id: Annotated[str, InjectedToolCallId],
+    max_results: Annotated[int, InjectedToolArg] = 1,  # hidden from LLM
+) -> Command:
+    results = run_tavily_search(query, max_results=max_results)
+    files = state.get("files", {})
+    summaries = []
+    for result in results:
+        summary_obj = summarize_webpage_content(result["content"])  # cheap model
+        uid = base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b"=").decode("ascii")[:8]
+        name, ext = os.path.splitext(summary_obj.filename)
+        filename = f"{name}_{uid}{ext}"
+        files[filename] = result["content"]  # full content → file
+        summaries.append(f"- {filename}: {summary_obj.summary}")  # summary → message
+    return Command(update={
+        "files": files,
+        "messages": [ToolMessage("\n".join(summaries), tool_call_id=tool_call_id)],
+    })
+```
+
+**Key details:**
+- UUID suffix on filenames prevents collisions across searches
+- `InjectedToolArg` hides config params (not state) from the LLM schema — distinct from `InjectedState`
+- The summarization model is cheap (GPT-4o-mini), not the main reasoning model
+
+### 3.6 Think Tool (No-Op Forced Reflection)
+
+A tool that does nothing computationally — it returns its input unchanged. Its purpose is to force the LLM to produce a structured reasoning step that stays in context as a `ToolMessage`.
+
+```python
+@tool(parse_docstring=True)
+def think_tool(reflection: str) -> str:
+    """Tool for strategic reflection on research progress and decision-making.
+
+    Reflection should address:
+    1. Analysis of current findings
+    2. Gap assessment — what's missing
+    3. Quality evaluation — is the evidence sufficient
+    4. Strategic decision — what to do next
+
+    Args:
+        reflection: Your structured reflection.
+    """
+    return f"Reflection recorded: {reflection}"
+```
+
+**Why it works**: the LLM produces better decisions when forced to articulate reasoning as a tool call. The detailed docstring guides what to reflect about. The reflection persists in message history as an explicit reasoning checkpoint.
+
+---
+
+## 4. LangGraph Patterns (Snippets)
+
+### 4.1 State with Reducers and Output Schema
 
 ```python
 class OrchestratorState(TypedDict):
@@ -115,7 +315,7 @@ class OrchestratorOutput(TypedDict):  # only these fields returned to caller
 graph = StateGraph(OrchestratorState, output_schema=OrchestratorOutput)
 ```
 
-### 3.2 ReAct Loop Wiring
+### 4.2 ReAct Loop Wiring
 
 ```python
 graph.add_node("agent", agent_node)
@@ -129,7 +329,7 @@ graph.add_edge("tools", "agent")  # the loop
 graph.add_edge("response_formatter", END)
 ```
 
-### 3.3 Command: Cross-Graph State Updates from Tools
+### 4.3 Command: Cross-Graph State Updates from Tools
 
 Tools return `Command` to write into the parent graph's state:
 
@@ -145,7 +345,7 @@ async def call_sub_agent(task: str,
     })
 ```
 
-### 3.4 Command with Routing (goto)
+### 4.4 Command with Routing (goto)
 
 ```python
 def review_node(state) -> Command[Literal["approve", "reject"]]:
@@ -155,7 +355,7 @@ def review_node(state) -> Command[Literal["approve", "reject"]]:
     return Command(update={"approved": False}, goto="reject")
 ```
 
-### 3.5 InjectedState & InjectedToolCallId
+### 4.5 InjectedState, InjectedToolCallId & InjectedToolArg
 
 Hide parameters from the LLM tool schema while injecting them at runtime:
 
@@ -166,10 +366,16 @@ def my_tool(
     state: Annotated[dict, InjectedState],               # hidden, full state
     prefs: Annotated[dict, InjectedState("preferences")], # hidden, specific field
     tool_call_id: Annotated[str, InjectedToolCallId],    # hidden, auto-injected
+    max_results: Annotated[int, InjectedToolArg] = 5,    # hidden, programmatic config
 ) -> str: ...
 ```
 
-### 3.6 Structured Output with Pydantic
+Three injection types:
+- `InjectedState` — injects the full state (or a specific field) at runtime
+- `InjectedToolCallId` — auto-injects the tool_call_id for constructing `ToolMessage` responses
+- `InjectedToolArg` — hides programmatic configuration parameters (not state) from the LLM schema. Use for knobs the orchestrator controls (e.g., `max_results`, `topic`, `timeout`)
+
+### 4.6 Structured Output with Pydantic
 
 Replace manual JSON parsing with schema-enforced extraction:
 
@@ -192,7 +398,7 @@ raw = result["raw"]             # raw AIMessage
 
 Update prompts accordingly: remove explicit JSON format examples — the Pydantic schema is provided to the LLM via function calling. Keep semantic rules (field meanings, valid values, edge cases).
 
-### 3.7 Map-Reduce with Send API
+### 4.7 Map-Reduce with Send API
 
 Fan out to parallel node executions, collect results with a reducer:
 
@@ -207,7 +413,7 @@ def fan_out(state: State) -> list[Send]:
 builder.add_conditional_edges(START, fan_out)
 ```
 
-### 3.8 Human-in-the-Loop with interrupt()
+### 4.8 Human-in-the-Loop with interrupt()
 
 ```python
 from langgraph.types import interrupt, Command
@@ -229,7 +435,7 @@ result = graph.invoke(Command(resume="yes"), config)
 
 **Key**: `interrupt()` requires a checkpointer. The `thread_id` is your resume pointer.
 
-### 3.9 Checkpointing & Persistence
+### 4.9 Checkpointing & Persistence
 
 ```python
 # In-memory (dev/testing)
@@ -247,7 +453,7 @@ graph = builder.compile(checkpointer=PostgresSaver(conn_string))
 
 Every `invoke()` with a `thread_id` saves state. Resume any thread, even after process restart (with durable checkpointer).
 
-### 3.10 Sub-Graph as Tool (Full Pattern)
+### 4.10 Sub-Graph as Tool (Full Pattern)
 
 ```python
 # 1. Define sub-agent state (isolated from orchestrator)
@@ -286,9 +492,72 @@ ALL_TOOLS = [call_sub_agent, ...]
 graph.add_node("tools", ToolNode(ALL_TOOLS))
 ```
 
+### 4.11 Sub-Agent Registry Factory
+
+Pre-compile sub-agents into a registry and generate a `task` tool with dynamic description. Each sub-agent gets a targeted tool subset from a shared pool.
+
+```python
+class SubAgent(TypedDict):
+    name: str
+    description: str
+    prompt: str
+    tools: NotRequired[list[str]]  # tool names from shared pool
+
+def _create_task_tool(tools, subagents: list[SubAgent], model, state_schema):
+    # Build tool lookup
+    tools_by_name = {}
+    for t in tools:
+        if not isinstance(t, BaseTool):
+            t = tool(t)
+        tools_by_name[t.name] = t
+
+    # Pre-compile sub-agents with selective tool assignment
+    agents = {}
+    for sa in subagents:
+        sa_tools = [tools_by_name[n] for n in sa["tools"]] if "tools" in sa else tools
+        agents[sa["name"]] = create_agent(
+            model, system_prompt=sa["prompt"], tools=sa_tools, state_schema=state_schema
+        )
+
+    # Inject available agents into tool description
+    agents_desc = "\n".join(f"- {sa['name']}: {sa['description']}" for sa in subagents)
+
+    @tool(description=f"Delegate a task to a sub-agent.\n\nAvailable agents:\n{agents_desc}")
+    def task(description: str, subagent_type: str, ...):
+        if subagent_type not in agents:
+            return f"Error: unknown agent '{subagent_type}'. Valid: {list(agents.keys())}"
+        ...
+
+    return task
+```
+
+**Key decisions:**
+- `tools_by_name` lookup lets each sub-agent pick specific tools from the shared pool
+- Available agent types are injected into the tool description at registration time — the LLM knows its options
+- Validation returns actionable error messages (valid agent names) so the LLM can self-correct
+
+### 4.12 Streaming with Subgraph Visibility
+
+Debug multi-agent systems by streaming updates from all levels:
+
+```python
+async for graph_name, stream_mode, event in agent.astream(
+    query,
+    stream_mode=["updates", "values"],  # incremental + complete state
+    subgraphs=True,                      # see inside sub-agents
+    config=config,
+):
+    if stream_mode == "updates":
+        node, result = list(event.items())[0]
+        if "messages" in result:
+            display(result["messages"])
+    elif stream_mode == "values":
+        current_state = event
+```
+
 ---
 
-## 4. Prompt Engineering for Agents
+## 5. Prompt Engineering for Agents
 
 ### System Prompt Structure (Orchestrators)
 
@@ -306,6 +575,7 @@ graph.add_node("tools", ToolNode(ALL_TOOLS))
 - Docstring = the LLM's only guide. Be specific about **when** to use the tool, not just what it does.
 - Use `parse_docstring=True` so `Args:` section becomes parameter descriptions.
 - Keep parameter names semantic: `task` not `input`, `context` not `extra`.
+- **Override pattern**: `@tool(description=CONSTANT)` separates the LLM-facing description from the code docstring. The `description` parameter replaces the docstring for the LLM, letting you keep app-specific instructions in a prompts module.
 
 ### Structured Output Prompts
 
@@ -314,9 +584,53 @@ When using `with_structured_output` / Pydantic schemas:
 - **Keep** semantic rules: valid values, edge cases, field relationships, dictionaries/mappings
 - **Keep** classification logic and examples that help the LLM decide field values
 
+### Composite Prompt Assembly
+
+Build system prompts from modular constants, not monolithic strings:
+
+```python
+INSTRUCTIONS = (
+    "# TODO MANAGEMENT\n" + TODO_USAGE_INSTRUCTIONS
+    + "\n\n" + "=" * 80 + "\n\n"
+    + "# FILE SYSTEM USAGE\n" + FILE_USAGE_INSTRUCTIONS
+    + "\n\n" + "=" * 80 + "\n\n"
+    + "# SUB-AGENT DELEGATION\n" + SUBAGENT_INSTRUCTIONS
+)
+```
+
+Each module owns its prompt section. Separator lines (`===`) visually delineate sections for the LLM. Use XML tags (`<Task>`, `<Instructions>`, `<Hard Limits>`) within sections for further structure.
+
+### Hard Limits in Delegation Prompts
+
+Prevent runaway research loops at the prompt level (complementing `recursion_limit` at the graph level):
+
+```
+<Hard Limits>
+- Simple queries: 1-2 tool calls max
+- Normal research: 2-3 tool calls max
+- Complex multi-faceted: up to 5 tool calls max
+- STOP when 3+ relevant sources found
+- STOP when last 2 searches return similar information
+</Hard Limits>
+```
+
+### Scaling Rules for Sub-Agent Delegation
+
+Give the orchestrator concrete guidance on how many sub-agents to spawn:
+
+```
+- Simple fact-finding: 1 sub-agent
+- A-vs-B comparison: 1 sub-agent per element
+- Multi-faceted research: parallel agents for different aspects
+- Each sub-agent stores findings in separate files
+- Max N parallel agents per iteration (to limit cost)
+```
+
+Instruct parallel execution explicitly: *"When you identify multiple independent research directions, make multiple task tool calls in a single response to enable parallel execution."*
+
 ---
 
-## 5. Anti-Patterns & Pitfalls
+## 6. Anti-Patterns & Pitfalls
 
 | Anti-pattern | Why it's bad | Fix |
 |---|---|---|
@@ -330,12 +644,18 @@ When using `with_structured_output` / Pydantic schemas:
 | Hardcoded routing in a graph that needs flexibility | Every new route = code change | Use ReAct with tool selection instead |
 | Amending prompts for structured output format | Redundant with schema, can conflict | Let Pydantic model define the format |
 | Stateless analysis across calls | Agent forgets prior work in multi-turn sessions | Add a scratchpad/memo persisted in parent state |
+| No context anchoring on long tasks | Agent drifts from objectives after ~50 tool calls (context rot) | TODO write-read-reflect cycle (§3.1) |
+| Raw tool results in messages | Token-heavy content fills context, displaces reasoning | Context offloading: content → files, summaries → messages (§3.2) |
+| Sub-agents inherit parent context | Context clash, confusion, poisoning from irrelevant history | Replace messages with task-only context (§3.4) |
+| Same model for all cognitive loads | Expensive model wasted on summarization/formatting | Two-tier: cheap model for extraction, expensive for reasoning (§2.7) |
+| No structured reflection checkpoints | Agent makes impulsive decisions on complex multi-step tasks | think_tool forces articulated reasoning (§3.6) |
+| Generic error strings from tools | LLM can't self-correct without knowing valid options | Include valid values and retry hints in error messages (§2.4) |
 
 > For infrastructure-level anti-patterns (auth, concurrency, security), see [INFRA_PATTERNS.md](./INFRA_PATTERNS.md#5-anti-patterns--pitfalls).
 
 ---
 
-## 6. References
+## 7. References
 
 ### Docs
 - [LangGraph Concepts](https://langchain-ai.github.io/langgraph/concepts/) — state, reducers, edges, persistence
@@ -354,3 +674,6 @@ When using `with_structured_output` / Pydantic schemas:
 - [ReAct: Synergizing Reasoning and Acting](https://arxiv.org/abs/2210.03629) — the foundational pattern
 - [Plan-and-Solve Prompting](https://arxiv.org/abs/2305.04091) — planning before execution
 - [Anthropic: Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents) — practical patterns from production
+
+### Tutorials
+- [deep-agents-from-scratch](../deep-agents-from-scratch/) — progressive tutorial: TODO anchoring → virtual filesystem → sub-agents → full research agent
