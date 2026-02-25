@@ -70,22 +70,34 @@ Why this works:
 - Stub/circuit-breaker: check external service health before entering the main agent loop. Short-circuit with a canned response when the backend is down.
 - **Error messages for LLM consumption**: design tool error strings with actionable information (valid options, what went wrong, how to retry). The LLM is the consumer, not a human.
 
-### 2.5 Dynamic Prompt Injection
+### 2.5 Dynamic State Injection (Working Memory)
 
-Serialize accumulated state (plan, references, analyses) into the system prompt on every LLM call. This gives the LLM a "working memory" view without relying on it to parse long message histories.
+Give the LLM a structured "working memory" view of accumulated state (plan progress, references, intermediate results) without relying on it to parse long message histories.
+
+**Where to inject:** into the **latest user message**, not the system prompt. The system prompt should stay static (role, instructions, tool docs, few-shot examples) so it remains cached across turns (see §3.7). Modifying the system prompt on every call invalidates the entire prompt cache — system and all messages — defeating prefix reuse.
+
+```
+System prompt (STATIC — cached once, reused every turn):
+  Role definition, tool descriptions, instructions, few-shot examples
+
+Latest user message (DYNAMIC — appended each turn, after cached prefix):
+  <working_memory>
+    <plan>
+      1. [✅ completed] Fetch CFR data for УОР
+      2. [🔄 in_progress] Fetch CFR data for УРТВБ
+      3. [⏳ pending] Compare and analyze
+    </plan>
+    <active_references>
+      metrics_a1b2: CFR data for УОР (metrics, diff)
+    </active_references>
+  </working_memory>
+
+  [actual user query or tool results here]
+```
 
 Best format: structured text (XML tags, markdown sections). Keeps it parseable but doesn't waste tokens on JSON syntax.
 
-```
-<plan>
-  1. [✅ completed] Fetch CFR data for УОР
-  2. [🔄 in_progress] Fetch CFR data for УРТВБ
-  3. [⏳ pending] Compare and analyze
-</plan>
-<active_references>
-  metrics_a1b2: CFR data for УОР (metrics, diff)
-</active_references>
-```
+**In framework code** (e.g., LangGraph), inject the working memory block by prepending it to the latest `HumanMessage` content before the LLM call, or as a separate content block within the same message. The prior conversation history remains untouched, preserving the cached prefix.
 
 ### 2.6 Pre-processing & Shortcuts
 
@@ -294,6 +306,116 @@ def think_tool(reflection: str) -> str:
 ```
 
 **Why it works**: the LLM produces better decisions when forced to articulate reasoning as a tool call. The detailed docstring guides what to reflect about. The reflection persists in message history as an explicit reasoning checkpoint.
+
+### 3.7 Prompt Caching-Aware Context Design
+
+Most LLM providers (Anthropic, OpenAI, Google) support **prompt caching** — reusing the KV-cache of a previously seen prefix to skip recomputation. Cache hits are ~10x cheaper and significantly faster than reprocessing. Agents that make many sequential LLM calls (ReAct loops, multi-turn conversations) benefit enormously, but only if the context is structured to maximize prefix reuse.
+
+**How it works (provider-agnostic):** The provider caches the computed representation of a prompt prefix. On subsequent requests, if the prefix matches byte-for-byte, the cached computation is reused. Any change in the prefix invalidates downstream cache.
+
+**Cache hierarchy (Anthropic-specific but conceptually universal):**
+```
+tools → system prompt → messages (in order)
+```
+Changes at any level invalidate that level and all subsequent levels. Changing a tool definition invalidates everything. Changing the system prompt invalidates system + messages. Appending a new message preserves the cache for everything before it.
+
+**Core principle — append-only context:**
+
+Never modify or reorder earlier messages. Only append new messages at the end. This maximizes prefix reuse across turns:
+
+```
+Turn 1: [system] + [user:A]                         → cache miss, write
+Turn 2: [system] + [user:A] + [asst:B] + [user:C]   → cache hit on [system]+[user:A], write new
+Turn 3: [system] + [user:A] + [asst:B] + [user:C] + [asst:D] + [user:E]  → cache hit through [user:C]
+```
+
+If turn 2 had reformulated `[user:A]` instead of appending, the entire cache would be invalidated.
+
+**Practical rules for agent builders:**
+
+1. **Static content first, dynamic content last.** Place tool definitions, system instructions, few-shot examples, and reference documents at the beginning. Put the evolving conversation at the end. The static prefix gets cached once and reused across all turns.
+
+2. **Don't rewrite history.** Never modify the system prompt or earlier messages between turns. For dynamic state injection (§2.5), put working memory into the latest user message — the system prompt stays static and cached.
+
+3. **Summarize-and-append, don't summarize-and-replace.** When context grows too large, summarize older messages with a cheap model and append the summary as a new message. Don't delete the old messages mid-conversation (that invalidates cache). Instead, start a new conversation branch with: `[system] + [summary of prior context] + [recent messages]`.
+
+4. **Use explicit cache breakpoints at stability boundaries.** Mark the end of your static system prompt and tool definitions with a cache breakpoint. This ensures the stable prefix is cached independently from the volatile conversation:
+
+```python
+# Anthropic example — explicit breakpoint on system prompt
+response = client.messages.create(
+    model="claude-sonnet-4-6",
+    system=[{
+        "type": "text",
+        "text": SYSTEM_PROMPT + TOOL_INSTRUCTIONS + FEW_SHOT_EXAMPLES,
+        "cache_control": {"type": "ephemeral"},  # breakpoint: cache this independently
+    }],
+    cache_control={"type": "ephemeral"},  # auto-cache conversation tail
+    messages=conversation_history,  # append-only
+)
+```
+
+5. **Progressive summarization with cheap models.** When context exceeds a threshold (e.g., 80% of window), summarize the oldest N messages using a cheap model (Haiku, GPT-4o-mini). The summarization prompt should preserve: key decisions made, facts discovered, current plan state, and any file/artifact references. Inject the summary as the first user message in a fresh conversation:
+
+```python
+def maybe_compress_context(messages, max_tokens=100_000):
+    token_count = estimate_tokens(messages)
+    if token_count < max_tokens * 0.8:
+        return messages  # no compression needed
+
+    # Split: old messages to summarize, recent messages to keep verbatim
+    split_point = len(messages) // 2
+    old_messages = messages[:split_point]
+    recent_messages = messages[split_point:]
+
+    summary = cheap_model.invoke(
+        f"Summarize this conversation preserving: decisions made, "
+        f"facts discovered, current plan, and artifact references.\n\n"
+        f"{format_messages(old_messages)}"
+    )
+
+    return [
+        {"role": "user", "content": f"<context_summary>\n{summary}\n</context_summary>"},
+        {"role": "assistant", "content": "Understood. I have the context from our prior conversation."},
+        *recent_messages,
+    ]
+```
+
+6. **Keep tool definitions static — disable tools via error responses, not schema removal.** Tools sit at the top of the cache hierarchy (`tools → system → messages`). Removing a tool from the `tools` array invalidates the entire prompt cache. Use a two-step escalation instead:
+
+**Step 1 — error stub (cache-safe, handles ~99% of cases):** The tool remains in the schema but returns a structured error when called after a budget/limit is reached. The LLM learns from the error and stops calling it. Reinforce by injecting a "do NOT call tool X" reminder into the latest user message via §2.5 working memory.
+
+**Step 2 — remove tool (cache-breaking fallback):** If the LLM calls the tool *again* despite the error, remove it from the `tools` array on the next turn. This invalidates the cache but prevents an infinite loop. This is a safety net that should rarely trigger.
+
+```python
+@tool
+def web_search(query: str, state: Annotated[dict, InjectedState],
+               tool_call_id: Annotated[str, InjectedToolCallId]):
+    remaining = state.get("search_budget", 3)
+    if remaining <= 0:
+        # Step 1: error stub (cache-safe). Track that we returned an error.
+        return Command(update={
+            "search_exhausted": True,
+            "messages": [ToolMessage(
+                "Search limit reached (3/3 used). You MUST use already collected information.",
+                tool_call_id=tool_call_id,
+            )],
+        })
+    # ... actual search logic ...
+    return Command(update={"search_budget": remaining - 1, ...})
+
+# In the agent node — step 2: remove tool only if LLM ignored the error
+def agent_node(state):
+    tools = ALL_TOOLS
+    if state.get("search_exhausted"):
+        tools = [t for t in tools if t.name != "web_search"]  # cache cost, but prevents loop
+    return model.bind_tools(tools).invoke(state["messages"])
+```
+
+**Provider-specific notes:**
+- **Anthropic**: Min cacheable prefix is 1024-4096 tokens (model-dependent). Up to 4 explicit breakpoints. 5-min TTL (refreshed on hit), optional 1-hour TTL at 2x cost. Cache reads = 10% of base input price.
+- **OpenAI**: Automatic prompt caching on all requests ≥1024 tokens. No explicit breakpoints — caching is fully automatic and prefix-based. No additional cost for cache writes.
+- **Google (Gemini)**: Supports explicit "cached content" objects that persist across requests with configurable TTL.
 
 ---
 
@@ -883,6 +1005,10 @@ function buildMemorySection(params) {
 | Same model for all cognitive loads | Expensive model wasted on summarization/formatting | Two-tier: cheap model for extraction, expensive for reasoning (§2.7) |
 | No structured reflection checkpoints | Agent makes impulsive decisions on complex multi-step tasks | think_tool forces articulated reasoning (§3.6) |
 | Generic error strings from tools | LLM can't self-correct without knowing valid options | Include valid values and retry hints in error messages (§2.4) |
+| Editing/reordering earlier messages between turns | Invalidates prompt cache, re-processes entire context at full cost | Append-only context: add new messages, never modify old ones (§3.7) |
+| Using expensive model for context summarization | Wastes frontier-model capacity on a compression task | Summarize with cheap model (Haiku/GPT-4o-mini), keep expensive model for reasoning (§3.7) |
+| Removing tools from schema as first reaction to limits | Invalidates entire prompt cache (tools sit at top of cache hierarchy) | Return error stub first (cache-safe); only remove tool if LLM ignores the error (§3.7) |
+TODO: Check
 | No input sanitization from channels | Prompt injection via Unicode control chars, homoglyphs | Multi-layered defense: sanitize + detect + wrap + normalize (§6.1) |
 | Monolithic system prompt | Sub-agents get irrelevant sections, wasted context | Conditional sections + prompt modes: full/minimal/none (§6.2) |
 | Dumping all skills into prompt | Token bloat, LLM overwhelmed by 150+ skill descriptions | Token budget caps + on-demand reading via tool (§6.3) |
