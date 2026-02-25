@@ -70,22 +70,34 @@ Why this works:
 - Stub/circuit-breaker: check external service health before entering the main agent loop. Short-circuit with a canned response when the backend is down.
 - **Error messages for LLM consumption**: design tool error strings with actionable information (valid options, what went wrong, how to retry). The LLM is the consumer, not a human.
 
-### 2.5 Dynamic Prompt Injection
+### 2.5 Dynamic State Injection (Working Memory)
 
-Serialize accumulated state (plan, references, analyses) into the system prompt on every LLM call. This gives the LLM a "working memory" view without relying on it to parse long message histories.
+Give the LLM a structured "working memory" view of accumulated state (plan progress, references, intermediate results) without relying on it to parse long message histories.
+
+**Where to inject:** into the **latest user message**, not the system prompt. The system prompt should stay static (role, instructions, tool docs, few-shot examples) so it remains cached across turns (see §3.7). Modifying the system prompt on every call invalidates the entire prompt cache — system and all messages — defeating prefix reuse.
+
+```
+System prompt (STATIC — cached once, reused every turn):
+  Role definition, tool descriptions, instructions, few-shot examples
+
+Latest user message (DYNAMIC — appended each turn, after cached prefix):
+  <working_memory>
+    <plan>
+      1. [✅ completed] Fetch CFR data for УОР
+      2. [🔄 in_progress] Fetch CFR data for УРТВБ
+      3. [⏳ pending] Compare and analyze
+    </plan>
+    <active_references>
+      metrics_a1b2: CFR data for УОР (metrics, diff)
+    </active_references>
+  </working_memory>
+
+  [actual user query or tool results here]
+```
 
 Best format: structured text (XML tags, markdown sections). Keeps it parseable but doesn't waste tokens on JSON syntax.
 
-```
-<plan>
-  1. [✅ completed] Fetch CFR data for УОР
-  2. [🔄 in_progress] Fetch CFR data for УРТВБ
-  3. [⏳ pending] Compare and analyze
-</plan>
-<active_references>
-  metrics_a1b2: CFR data for УОР (metrics, diff)
-</active_references>
-```
+**In framework code** (e.g., LangGraph), inject the working memory block by prepending it to the latest `HumanMessage` content before the LLM call, or as a separate content block within the same message. The prior conversation history remains untouched, preserving the cached prefix.
 
 ### 2.6 Pre-processing & Shortcuts
 
@@ -323,7 +335,7 @@ If turn 2 had reformulated `[user:A]` instead of appending, the entire cache wou
 
 1. **Static content first, dynamic content last.** Place tool definitions, system instructions, few-shot examples, and reference documents at the beginning. Put the evolving conversation at the end. The static prefix gets cached once and reused across all turns.
 
-2. **Don't rewrite history.** When injecting state into the prompt (§2.5 Dynamic Prompt Injection), append a new system message or use a dedicated state block at a fixed position — don't retroactively edit earlier messages.
+2. **Don't rewrite history.** Never modify the system prompt or earlier messages between turns. For dynamic state injection (§2.5), put working memory into the latest user message — the system prompt stays static and cached.
 
 3. **Summarize-and-append, don't summarize-and-replace.** When context grows too large, summarize older messages with a cheap model and append the summary as a new message. Don't delete the old messages mid-conversation (that invalidates cache). Instead, start a new conversation branch with: `[system] + [summary of prior context] + [recent messages]`.
 
