@@ -381,6 +381,37 @@ def maybe_compress_context(messages, max_tokens=100_000):
     ]
 ```
 
+6. **Keep tool definitions static — disable tools via error responses, not schema removal.** Tools sit at the top of the cache hierarchy (`tools → system → messages`). Removing a tool from the `tools` array invalidates the entire prompt cache. Use a two-step escalation instead:
+
+**Step 1 — error stub (cache-safe, handles ~99% of cases):** The tool remains in the schema but returns a structured error when called after a budget/limit is reached. The LLM learns from the error and stops calling it. Reinforce by injecting a "do NOT call tool X" reminder into the latest user message via §2.5 working memory.
+
+**Step 2 — remove tool (cache-breaking fallback):** If the LLM calls the tool *again* despite the error, remove it from the `tools` array on the next turn. This invalidates the cache but prevents an infinite loop. This is a safety net that should rarely trigger.
+
+```python
+@tool
+def web_search(query: str, state: Annotated[dict, InjectedState],
+               tool_call_id: Annotated[str, InjectedToolCallId]):
+    remaining = state.get("search_budget", 3)
+    if remaining <= 0:
+        # Step 1: error stub (cache-safe). Track that we returned an error.
+        return Command(update={
+            "search_exhausted": True,
+            "messages": [ToolMessage(
+                "Search limit reached (3/3 used). You MUST use already collected information.",
+                tool_call_id=tool_call_id,
+            )],
+        })
+    # ... actual search logic ...
+    return Command(update={"search_budget": remaining - 1, ...})
+
+# In the agent node — step 2: remove tool only if LLM ignored the error
+def agent_node(state):
+    tools = ALL_TOOLS
+    if state.get("search_exhausted"):
+        tools = [t for t in tools if t.name != "web_search"]  # cache cost, but prevents loop
+    return model.bind_tools(tools).invoke(state["messages"])
+```
+
 **Provider-specific notes:**
 - **Anthropic**: Min cacheable prefix is 1024-4096 tokens (model-dependent). Up to 4 explicit breakpoints. 5-min TTL (refreshed on hit), optional 1-hour TTL at 2x cost. Cache reads = 10% of base input price.
 - **OpenAI**: Automatic prompt caching on all requests ≥1024 tokens. No explicit breakpoints — caching is fully automatic and prefix-based. No additional cost for cache writes.
@@ -743,6 +774,7 @@ Instruct parallel execution explicitly: *"When you identify multiple independent
 | Generic error strings from tools | LLM can't self-correct without knowing valid options | Include valid values and retry hints in error messages (§2.4) |
 | Editing/reordering earlier messages between turns | Invalidates prompt cache, re-processes entire context at full cost | Append-only context: add new messages, never modify old ones (§3.7) |
 | Using expensive model for context summarization | Wastes frontier-model capacity on a compression task | Summarize with cheap model (Haiku/GPT-4o-mini), keep expensive model for reasoning (§3.7) |
+| Removing tools from schema as first reaction to limits | Invalidates entire prompt cache (tools sit at top of cache hierarchy) | Return error stub first (cache-safe); only remove tool if LLM ignores the error (§3.7) |
 
 > For infrastructure-level anti-patterns (auth, concurrency, security), see [INFRA_PATTERNS.md](./INFRA_PATTERNS.md#5-anti-patterns--pitfalls).
 
