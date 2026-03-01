@@ -42,6 +42,7 @@ Production infrastructure for agent platforms — extracted from [OpenClaw](./so
 ### [solutions_architecture/](./solutions_architecture/)
 
 - [OPENCLAW_ARCHITECTURE.md](./solutions_architecture/OPENCLAW_ARCHITECTURE.md) — full architecture deep-dive of a production agent orchestration platform
+- [OPENCODE_ARCHITECTURE.md](./solutions_architecture/OPENCODE_ARCHITECTURE.md) — full architecture deep-dive of OpenCode (open-source AI coding agent, ~100K-LOC TypeScript)
 
 ### [code_snippets/](./code_snippets/)
 
@@ -56,6 +57,16 @@ code_snippets/OpenClaw/
   lifecycle_hooks.ts
   hybrid_memory_search.ts
   sandbox_security.ts
+
+code_snippets/OpenCode/
+  agent_definition.ts       — agent-as-config schema, permission merging, custom agent loading
+  subagent_invocation.ts    — Task tool gateway, child session isolation, resumable tasks
+  context_compaction.ts     — 3-stage context recovery (prune, summarize, auto-continue)
+  session_processor.ts      — core AI loop, stream event handling, doom loop detection, retries
+  tool_system.ts            — tool definition, registry, 9-stage fuzzy edit, batch execution
+  instance_context.ts       — AsyncLocalStorage isolation, per-directory state, monotonic IDs
+  snapshot_revert.ts        — git-based filesystem snapshots, per-file revert, full restore
+  event_bus_sse.ts          — typed event bus, global cross-instance streaming, SSE + 16ms batching
 ```
 
 ## Sources
@@ -63,6 +74,7 @@ code_snippets/OpenClaw/
 Patterns are drawn from:
 
 - Production work on [OpenClaw](./solutions_architecture/OPENCLAW_ARCHITECTURE.md) (multi-channel agent platform)
+- Architecture analysis of [OpenCode](./solutions_architecture/OPENCODE_ARCHITECTURE.md) (open-source AI coding agent)
 - [deep-agents-from-scratch](https://github.com/) tutorials (TODO anchoring, virtual FS, context offloading, sub-agents)
 - [Anthropic: Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents)
 - [LangGraph](https://github.com/langchain-ai/langgraph) docs and patterns
