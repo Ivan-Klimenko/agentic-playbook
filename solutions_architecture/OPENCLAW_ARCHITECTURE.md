@@ -579,7 +579,293 @@ See: `src/auto-reply/reply/untrusted-context.ts`
 
 ---
 
-## 8. Key Takeaways for Agent Builders
+## 8. Seven-Dimension Agent Analysis
+
+A structured analysis of OpenClaw's agent architecture across seven critical dimensions. Each subsection answers specific design questions relevant to anyone building production agent systems.
+
+### 8.1 Architecture & Agent Topology
+
+**Architecture type: Orchestrator + Spawnable Subagents**
+
+OpenClaw is NOT a swarm, NOT a fixed specialist pool, and NOT a multi-agent peer network. It uses a single primary agent per session with the ability to spawn subagents on demand.
+
+```
+┌──────────────────────────────────────────────┐
+│  Gateway (singleton process)                  │
+│                                               │
+│  ┌────────────────────────────────────────┐   │
+│  │  Agent Run (per-session)                │   │
+│  │  ├─ runEmbeddedPiAgent() ← main entry  │   │
+│  │  │                                      │   │
+│  │  ├─ Sub-agent (depth 1)                 │   │
+│  │  │   └─ Sub-agent (depth 2)             │   │
+│  │  │       └─ Leaf (depth = max, no spawn)│   │
+│  │  │                                      │   │
+│  │  └─ Sub-agent registry (in-memory)      │   │
+│  └────────────────────────────────────────┘   │
+│                                               │
+│  ┌────────────────────────────────────────┐   │
+│  │  Another Agent Run (different session)   │   │
+│  └────────────────────────────────────────┘   │
+└──────────────────────────────────────────────┘
+```
+
+**Agent differentiation:** Agents are differentiated by configuration role (different system prompts, tool policies, workspaces), NOT by class or code. Every agent runs through the same `runEmbeddedPiAgent()` function with different config params.
+
+**Inter-agent communication:**
+- **Primary mechanism:** `callGateway()` RPC — agents communicate via the gateway's internal method registry, not direct message passing
+- **Subagent spawn:** `sessions_spawn` tool creates a child agent with its own session key (`agent:{id}:subagent:{uuid}`)
+- **Message steering:** `queueEmbeddedPiMessage()` injects messages into an active agent's run in real-time (e.g., new incoming messages while the agent is processing)
+- **No shared message bus:** agents don't broadcast; communication is point-to-point via gateway
+
+**Routing:** Multi-tier priority routing resolves which agent handles a message:
+1. Direct assignment (explicit agent ID in route config)
+2. Channel-specific routing rules
+3. Account-level default agent
+4. System default
+
+See: `src/agents/pi-embedded-runner/run.ts`, `src/agents/subagent-spawn.ts`, `src/routing/resolve-route.ts`
+
+### 8.2 Context Management
+
+**Context window budget system:**
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| Hard limit per tool result | 400 KB | Prevents any single tool call from consuming the context |
+| Context share per tool result | 30% of context max | No single tool result can take more than 30% of window |
+| Headroom ratio | 0.75 | Reserve 25% of context for model output and new messages |
+| Single tool share | 0.50 | Within headroom, a single tool result capped at 50% |
+
+**5-tier error recovery (extended from the 3-tier compaction):**
+
+```
+Tier 1: In-Attempt Auto-Compaction
+  └─ SDK detects context overflow during tool loop
+  └─ Automatic compaction within the current attempt
+
+Tier 2: Explicit Overflow Compaction
+  └─ Gateway triggers external compaction (summarize older messages)
+  └─ Increments compaction counter, retries prompt
+
+Tier 3: Tool Result Truncation
+  └─ Identify oversized tool results
+  └─ Truncate to fit within context share limits
+
+Tier 4: Thinking Level Downgrade
+  └─ Reduce extended thinking budget
+  └─ Frees token budget for content
+
+Tier 5: Auth Profile Rotation
+  └─ Switch to a different model/provider
+  └─ May have a larger context window
+```
+
+**History truncation:** Per-session configurable via `sessionKey` config. Messages beyond the limit are dropped from the front (oldest first). No explicit summarization-on-truncation — the compaction layer handles that separately.
+
+**Context shielding:** Subagents get completely fresh context. They don't inherit the parent's message history. Inter-agent data transfer happens through the tool result (parent sees subagent output as a `ToolMessage`), not through shared context.
+
+**What's NOT present:** No sliding-window summarization, no RAG over conversation history, no checkpoint-and-restore for mid-run context. The approach is: budget hard, compact aggressively, truncate tool results, and shield subagents from parent context.
+
+See: `src/agents/pi-embedded-runner/tool-result-truncation.ts`, `src/agents/compaction.ts`, `src/agents/pi-embedded-runner/history.ts`
+
+### 8.3 Planning & Execution
+
+**No explicit planning phase.** This is a key architectural decision.
+
+OpenClaw does NOT have:
+- A plan object or plan state machine
+- A dedicated planning LLM call before execution
+- A plan tool that the agent calls to create/update a structured plan
+- Dynamic replanning triggered by plan-vs-reality divergence
+- Plan approval gates or plan review steps
+
+**How planning works instead:** Planning is delegated entirely to the LLM via the system prompt. The system prompt instructs the agent on what to consider, what tools to use, and how to approach tasks. The LLM plans implicitly within its reasoning (optionally in extended thinking blocks) and executes in a single ReAct loop.
+
+**Why this works for OpenClaw:** The platform handles diverse, often short-lived tasks from messaging channels (Slack, Discord, Telegram). Most interactions are conversational — a user asks a question, the agent responds, maybe calling 1-3 tools. For these cases, a formal planning phase would add latency without benefit.
+
+**Tradeoff:** This approach relies heavily on the LLM's ability to self-organize multi-step tasks. For complex, multi-step research or coding tasks, the lack of an explicit plan means the agent can lose coherence over long runs (~50+ tool calls). The mitigation is the dual-loop retry mechanism (§8.6) and thinking block support (§8.4), not a plan-and-execute architecture.
+
+**Comparison with plan-based agents:**
+```
+Plan-and-Execute Agent:           OpenClaw:
+  Plan → [Step1, Step2, Step3]      System prompt → LLM decides
+  Execute Step1                     LLM calls tools as needed
+  Check plan progress               LLM self-monitors via thinking
+  Replan if needed                  No replanning — retry on error
+  Execute Step2...                  Continue until stop_reason != tool_use
+```
+
+### 8.4 Thinking & Reasoning
+
+**Extended thinking is an optional model capability, not a tool.** Unlike the "think tool" pattern (a no-op tool that forces structured reflection), OpenClaw uses the model's native thinking feature (Claude's `thinking` blocks).
+
+**Multi-level reasoning configuration:**
+
+| Level | Budget Tokens | Use Case |
+|-------|--------------|----------|
+| `off` | 0 | Fast responses, simple queries |
+| `minimal` | 1,024 | Light reasoning |
+| `low` | 4,096 | Standard tasks |
+| `medium` | 10,000 | Complex analysis |
+| `high` | 32,000 | Deep reasoning |
+| `xhigh` | 100,000 | Maximum reasoning (model-dependent) |
+
+**Automatic capability fallback:**
+```
+Requested: "high" + Model: binary-only → Resolved: "medium"
+Requested: "xhigh" + Model: no-xhigh  → Resolved: "high"
+Requested: "medium" + Model: no-thinking → Resolved: "off"
+```
+
+**Thinking block lifecycle:**
+1. LLM generates thinking blocks during inference (if level != off)
+2. Thinking blocks are included in the current response
+3. Before re-sending history, all thinking blocks are stripped from assistant messages
+4. If stripping leaves an empty assistant message, an empty text block preserves message alternation
+5. Think level is communicated in the system prompt: `Reasoning: {level}`
+
+**No think tool:** OpenClaw does not implement a "think tool" (a tool that returns its input as a reflection checkpoint). All reasoning happens natively within the model's extended thinking capability. The tradeoff: native thinking is more natural and doesn't consume a tool call, but it's stripped from history and not visible in the message transcript.
+
+See: `src/agents/pi-embedded-runner/thinking.ts`, `src/auto-reply/thinking.ts`
+
+### 8.5 Tool System
+
+**Tool selection: pure LLM choice.** There is no planner, no rule-based tool router, no tool recommendation engine. The LLM sees the available tools (filtered by the 7-layer policy pipeline) and chooses which to call based on its system prompt and conversation context.
+
+**Tool execution: sequential within a turn.** When the LLM returns multiple tool calls in a single response, they are executed sequentially (not in parallel). Each tool result is appended to the message history before the next tool executes.
+
+**Tool interface:** All tools implement `AgentTool<P, D>` from `pi-agent-core`:
+```typescript
+interface AgentTool<P, D> {
+  name: string;
+  description: string;
+  parameters: JSONSchema;      // Input schema
+  execute: (params: P) => Promise<ToolResult<D>>;
+  label?: string;              // Short display label
+}
+```
+
+**Tool result structure:** Results have `content` (string for LLM) and `details` (object for UI/audit, stripped before LLM sees it).
+
+**4-layer tool loop detection:**
+
+| Detector | What it catches | Mechanism |
+|----------|----------------|-----------|
+| `generic_repeat` | Agent calling the same tool with same args repeatedly | Track last N calls, compare args |
+| `known_poll_no_progress` | Polling patterns (e.g., repeated `exec` checking status) | Detect poll-like patterns without state change |
+| `global_circuit_breaker` | Total tool calls exceeding threshold | Hard cap on calls per run |
+| `ping_pong` | Two tools alternating back and forth | Detect A→B→A→B pattern |
+
+When a loop is detected, the system injects a corrective message into the conversation to nudge the agent out of the loop, rather than terminating the run.
+
+**Meta-tools (tools that manage other tools/agents):**
+- `sessions_spawn` — spawn a subagent
+- `sessions_send` — send a message to an active session
+- `sessions_list` / `sessions_history` — query session state
+- `gateway` — call gateway RPC methods
+
+**Plugin tool factory:** Plugins create tools via factory functions registered at startup. Tool instances are created per-run with access to the current session context.
+
+See: `src/agents/tool-loop-detection.ts`, `src/agents/pi-tools.before-tool-call.ts`, `src/agents/pi-tools.policy.ts`
+
+### 8.6 Flow Control & Error Handling
+
+**Dual-loop architecture:**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  OUTER LOOP (file: run.ts, ~1135 lines)                 │
+│  Purpose: retry, failover, recovery                     │
+│  Controls: auth profile rotation, compaction triggers,  │
+│           overflow recovery, max iteration tracking      │
+│                                                         │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │  INNER LOOP (file: attempt.ts, ~1369 lines)       │  │
+│  │  Purpose: single inference attempt                 │  │
+│  │  Controls: SDK agent invocation, streaming,        │  │
+│  │           tool call execution, message building,   │  │
+│  │           tool loop detection                      │  │
+│  │                                                    │  │
+│  │  SDK Tool Loop:                                    │  │
+│  │    LLM call → parse response → tool calls?         │  │
+│  │      YES → execute tools → append results → loop   │  │
+│  │      NO  → extract final response → return         │  │
+│  └───────────────────────────────────────────────────┘  │
+│                                                         │
+│  On failure → classify error → recovery strategy:       │
+│    auth error    → rotate profile, retry                │
+│    overflow      → compact + retry                      │
+│    timeout       → mark profile, rotate, retry          │
+│    tool loop     → inject corrective message            │
+│    unknown       → increment counter, retry or fail     │
+└─────────────────────────────────────────────────────────┘
+```
+
+**Max iterations:** `24 base + 8 per auth profile` (min 32, max ~160 depending on configured profiles). This is NOT per-attempt — it's the total iteration budget across all retries.
+
+**Done detection:** The SDK's `stop_reason` field drives the control flow:
+- `stop_reason === "tool_use"` → more tool calls to process, continue inner loop
+- `stop_reason === "end_turn"` or other → agent is done, extract final response
+- No explicit "done" tool — done is a model signal, not a tool call
+
+**HITL (Human-in-the-Loop):** Implemented as a **tool-level gate**, not a whole-run approval:
+- Only elevated bash commands trigger HITL (approval required before execution)
+- The agent run continues autonomously between approval points
+- No "approve the plan" or "approve the final output" gates
+- Approval is binary: allow or deny the specific tool execution
+
+**Token tracking:** Two distinct counters:
+- `accumulated` — total tokens used across all attempts in this run
+- `lastCall` — tokens from the most recent LLM call only
+
+The `lastCall` snapshot prevents inflating context estimates. If you only tracked accumulated usage, you'd overcount context size by N × context_window for N attempts.
+
+See: `src/agents/pi-embedded-runner/run.ts`, `src/agents/pi-embedded-runner/run/attempt.ts`
+
+### 8.7 State & Persistence
+
+**Session state:** 30+ field `SessionEntry` schema tracks everything about a session:
+
+```
+SessionEntry fields (key groups):
+  Identity:    sessionKey, agentId, accountId, channelId
+  Lifecycle:   startedAt, lastActiveAt, status, runCount
+  Context:     messages[], systemPrompt, model, thinkLevel
+  Concurrency: laneId, lockHolder, queueDepth
+  Metrics:     tokenUsage, toolCallCount, compactionCount
+  Config:      workspace, sandbox, authProfile, maxIterations
+```
+
+**Persistence model:** JSONL transcript files, one per session. Each event (message, tool call, tool result, model response) is appended as a JSON line. This provides:
+- Append-only durability (no corruption from partial writes)
+- Full audit trail
+- Replayability (theoretically — not actively used for state recovery)
+
+**What's NOT present:**
+- No formal checkpointing (can't "save and resume" a mid-run state)
+- No undo/revert capability
+- No state diffing or versioning
+- No cross-session state sharing (each session is isolated)
+- No real-time state replication to external stores
+
+**Lane-based concurrency:** Sessions are serialized through nested lane queues:
+```
+Session Lane (per-session: prevents concurrent processing of same session)
+  └─ Global Lane (cross-session: coordinates shared resources like auth profiles)
+       └─ Actual execution
+```
+
+**Active run tracking:** The system maintains a registry of currently running agent invocations via `activeRuns` map. This enables:
+- Message steering (injecting messages into active runs)
+- Status queries ("is this agent currently running?")
+- Graceful shutdown (wait for active runs to complete)
+
+See: `src/config/sessions/types.ts`, `src/agents/pi-embedded-runner/runs.ts`, `src/agents/pi-embedded-runner/lanes.ts`
+
+---
+
+## 9. Key Takeaways for Agent Builders
 
 ### Infrastructure
 1. **Embedded > microservice for agent loops** — running agents in-process eliminates network overhead and simplifies tool access. Retry/failover wraps the execution, not the deployment.
@@ -599,3 +885,12 @@ See: `src/auto-reply/reply/untrusted-context.ts`
 13. **Strip thinking blocks from history** — extended reasoning is useful for one pass but wastes context when re-sent. Preserve empty turns to maintain message alternation.
 14. **Separate display from LLM data** — tool results carry `details` for UI/audit but strip them before the LLM sees them. The LLM gets clean, minimal results.
 15. **Inline output directives** — let the agent express routing intent (`[[reply_to:id]]`, media, silence) in its text output instead of requiring separate tool calls.
+
+### Architecture & Flow (from 7-dimension analysis)
+16. **No-plan architecture works for conversational agents** — when most interactions are short (1-5 tool calls), a formal planning phase adds latency without benefit. Delegate planning to the LLM's reasoning via system prompt.
+17. **Dual-loop separation** — keep the retry/recovery loop (auth failover, compaction, overflow) separate from the tool-use loop (LLM call, tool execution, message building). Different concerns, different files, different responsibilities.
+18. **Done = model signal, not tool call** — use `stop_reason` from the SDK to detect completion. No "done" tool needed if your LLM reliably signals end_turn.
+19. **Tool loop detection beats hard caps** — instead of a flat max-tool-calls limit, detect specific loop patterns (repeat, poll, ping-pong, circuit breaker) and inject corrective messages. The agent self-corrects rather than being terminated.
+20. **HITL as tool-level gate** — approve individual dangerous operations (elevated bash commands), not the entire plan or final output. The agent runs autonomously between approval points.
+21. **Pure LLM tool selection scales** — with 30+ tools and 50+ skills, pure LLM selection (no planner, no rule-based router) works when backed by proper tool ordering, policy filtering, and descriptive tool schemas.
+22. **Message steering for real-time context** — injecting messages into active agent runs lets you handle new information arriving while the agent is processing, without restarting the run.

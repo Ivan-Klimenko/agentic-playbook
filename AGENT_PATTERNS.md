@@ -983,6 +983,138 @@ function buildMemorySection(params) {
 
 **Why conditional:** If the tool policy denies memory_search, instructing the LLM to "always search memory first" causes confusion — the LLM tries to use a tool it doesn't have, gets an error, retries, wastes tokens. Match prompt instructions to actual tool availability.
 
+### 6.10 No-Plan Architecture (Planning via System Prompt)
+
+Not every agent needs a formal plan-and-execute phase. OpenClaw delegates planning entirely to the LLM via the system prompt — no plan object, no plan tool, no plan state machine.
+
+**When this works:**
+- Conversational agents where most interactions are 1-5 tool calls
+- Diverse, unpredictable task types (messaging channels with open-ended queries)
+- Latency-sensitive environments where a planning call doubles response time
+
+**When you need explicit planning:**
+- Complex multi-step tasks requiring 20+ tool calls
+- Tasks where plan visibility matters (user wants to approve the approach)
+- Tasks requiring parallel fan-out to sub-agents (need a plan to know what to fan out)
+
+**The tradeoff:** Without explicit planning, the agent can lose coherence on long runs. OpenClaw mitigates this through multi-level thinking (§6.5), dual-loop retry (§6.13), and context budgeting (§6.6) — not through plan-and-execute.
+
+**Practical implication:** If you start with a no-plan architecture and find the agent drifting on long tasks, add a TODO/plan tool (§3.1) rather than redesigning the entire loop. Planning can be incremental.
+
+### 6.11 Tool Loop Detection (Pattern-Based, Not Hard Caps)
+
+A flat `max_tool_calls` limit is blunt — it kills legitimate long-running tasks along with runaway loops. OpenClaw uses 4 specialized detectors that identify specific loop patterns:
+
+| Detector | Pattern | Response |
+|----------|---------|----------|
+| `generic_repeat` | Same tool + same args N times | Inject "you're repeating yourself" message |
+| `known_poll_no_progress` | Polling-like calls with no state change | Inject "no progress detected" message |
+| `global_circuit_breaker` | Total calls exceeding threshold | Hard stop (last resort) |
+| `ping_pong` | Two tools alternating A→B→A→B | Inject "alternating loop detected" message |
+
+**Key design:** On detection, the system injects a corrective message into the conversation rather than terminating the run. The LLM reads the correction and adjusts its behavior. This preserves progress on long-running tasks.
+
+```
+Before detection:
+  LLM → tool_A(args) → result → LLM → tool_A(args) → result → LLM → ...
+
+After detection (generic_repeat triggered):
+  LLM → tool_A(args) → result → [INJECTED: "You've called tool_A 3 times with
+  identical arguments. The result won't change. Try a different approach."] → LLM
+  → tool_B(different_args) → ...
+```
+
+**When to use hard caps vs. pattern detection:**
+- Hard caps: safety net for billing protection (total tokens or total calls per run)
+- Pattern detection: quality control for agent behavior (loop-specific, preserves progress)
+
+Use both: pattern detectors for the common case, circuit breaker as a hard backstop.
+
+### 6.12 Pure LLM Tool Selection (No Planner, No Router)
+
+OpenClaw uses no tool routing logic — the LLM selects tools purely from its available tool set. No planner scores tool relevance. No rule-based router pre-filters. No tool recommendation engine suggests options.
+
+**Why this works at scale (30+ tools, 50+ skills):**
+1. **Policy filtering** — the 7-layer tool policy pipeline removes tools the agent shouldn't use, so the LLM only sees relevant tools
+2. **Canonical ordering** — core tools listed first in a fixed order prevents positional bias
+3. **Dynamic descriptions** — tool descriptions extracted from tool objects, not hardcoded, so they stay accurate
+4. **Skill budget** — skills listed as a scannable catalog, not inlined, preventing prompt bloat
+
+**When you need a planner/router:**
+- When tool selection accuracy drops below acceptable thresholds with pure LLM choice
+- When you have 100+ tools and the LLM can't reliably pick the right one
+- When tool selection needs deterministic guarantees (compliance, safety-critical)
+
+**Anti-pattern to avoid:** Don't add a tool recommender as a first optimization. Instead, improve tool descriptions, reduce the tool set via policy filtering, and fix ordering. These are cheaper and often sufficient.
+
+### 6.13 Dual-Loop Architecture (Retry vs. Tool Execution)
+
+Separate the retry/recovery loop from the tool-use loop. They have different concerns, different error types, and different recovery strategies.
+
+```
+OUTER LOOP (retry & recovery):              INNER LOOP (tool execution):
+  - Auth profile rotation                     - LLM inference call
+  - Context overflow compaction               - Parse tool calls from response
+  - Thinking level downgrade                  - Execute tools sequentially
+  - Max iteration tracking                    - Append results to messages
+  - Error classification                      - Tool loop detection
+  - Timeout handling                          - Done detection (stop_reason)
+```
+
+**Why separate:**
+- The inner loop handles normal tool execution flow (LLM calls tools, gets results, decides what's next)
+- The outer loop handles abnormal conditions (auth fails, context overflows, model timeouts)
+- Mixing them creates spaghetti error handling where retry logic is interleaved with tool execution
+- Each loop can be tested and reasoned about independently
+
+**OpenClaw's implementation:** `run.ts` (~1135 lines) for the outer loop, `attempt.ts` (~1369 lines) for the inner loop. Each is a single function with clear entry/exit points.
+
+**Done detection:** The inner loop ends when the SDK returns `stop_reason !== "tool_use"`. No explicit "done" tool is needed — completion is a model signal, not a tool call. This is simpler and more reliable than requiring the agent to call a `finish()` tool.
+
+### 6.14 HITL as Tool-Level Gate (Not Whole-Run Approval)
+
+OpenClaw implements human-in-the-loop as a **per-tool-call approval gate**, not as plan approval or output review.
+
+```
+Plan Approval HITL (not used):     Tool-Level HITL (OpenClaw):
+  Agent creates plan                 Agent runs autonomously
+  → Human approves/rejects plan      → Agent calls dangerous tool
+  → Agent executes approved plan     → System pauses for approval
+                                     → Human approves/rejects THIS call
+                                     → Agent continues running
+```
+
+**What triggers approval:** Only elevated bash commands (e.g., `rm -rf`, `git push --force`). Regular tool calls execute without interruption.
+
+**Why tool-level gates:**
+- Most agent actions are safe and don't need human oversight
+- Pausing the entire run for plan approval adds latency and frustration
+- Tool-level gates are surgically precise — only dangerous operations get reviewed
+- The agent maintains its reasoning continuity between approval points
+
+**When you need broader HITL:**
+- When the agent's output goes directly to external users (review before sending)
+- When actions are irreversible and high-impact (infrastructure changes, financial transactions)
+- When regulatory requirements mandate human review
+
+### 6.15 Message Steering (Real-Time Context Injection)
+
+When new messages arrive while an agent is actively processing, OpenClaw injects them into the running conversation via `queueEmbeddedPiMessage()`. This avoids restarting the agent run.
+
+**The problem this solves:** In messaging channels, users often send follow-up messages while the agent is still processing the first one. Without message steering, you'd either:
+- Drop the new message (bad UX)
+- Queue it for after the run completes (agent misses relevant context)
+- Restart the run with all messages (wastes all processing done so far)
+
+**How it works:**
+1. New message arrives while agent run is active
+2. System checks `activeRuns` registry for the session
+3. If active, `queueEmbeddedPiMessage()` adds the message to the run's pending queue
+4. The inner loop picks up the queued message at the next tool execution boundary
+5. The agent sees the new message as part of its conversation and can adjust
+
+**When to use:** Multi-turn conversational agents where user messages arrive asynchronously. Not needed for batch/offline processing where inputs are known upfront.
+
 ---
 
 ## 7. Anti-Patterns & Pitfalls
@@ -1008,7 +1140,6 @@ function buildMemorySection(params) {
 | Editing/reordering earlier messages between turns | Invalidates prompt cache, re-processes entire context at full cost | Append-only context: add new messages, never modify old ones (§3.7) |
 | Using expensive model for context summarization | Wastes frontier-model capacity on a compression task | Summarize with cheap model (Haiku/GPT-4o-mini), keep expensive model for reasoning (§3.7) |
 | Removing tools from schema as first reaction to limits | Invalidates entire prompt cache (tools sit at top of cache hierarchy) | Return error stub first (cache-safe); only remove tool if LLM ignores the error (§3.7) |
-TODO: Check
 | No input sanitization from channels | Prompt injection via Unicode control chars, homoglyphs | Multi-layered defense: sanitize + detect + wrap + normalize (§6.1) |
 | Monolithic system prompt | Sub-agents get irrelevant sections, wasted context | Conditional sections + prompt modes: full/minimal/none (§6.2) |
 | Dumping all skills into prompt | Token bloat, LLM overwhelmed by 150+ skill descriptions | Token budget caps + on-demand reading via tool (§6.3) |
@@ -1016,6 +1147,12 @@ TODO: Check
 | Keeping thinking blocks in history | Previous reasoning tokens waste context on re-send | Strip thinking blocks, preserve empty turns (§6.5) |
 | Verbose tool results sent to LLM | Token waste, potential injection from external payloads | Strip details field, use semantic summaries (§6.6) |
 | Memory instructions without memory tools | LLM tries to call tools it doesn't have → error loop | Conditional prompt sections matched to tool availability (§6.9) |
+| Formal plan-and-execute for every agent | Doubles latency for simple conversational tasks | No-plan architecture for short interactions; add TODO tool incrementally for longer tasks (§6.10) |
+| Flat `max_tool_calls` as only loop protection | Kills legitimate long-running tasks alongside runaway loops | Pattern-based detection (repeat, poll, ping-pong) + corrective messages; hard cap as backstop only (§6.11) |
+| Adding a tool recommender/router as first optimization | Over-engineering; usually tool descriptions or ordering are the real problem | Improve descriptions, reduce set via policy, fix ordering first (§6.12) |
+| Mixing retry/recovery logic with tool execution loop | Spaghetti error handling, hard to test and reason about | Dual-loop: outer loop for retry/failover, inner loop for tool execution (§6.13) |
+| Whole-run approval gates for HITL | Agent loses reasoning continuity, adds latency to every run | Tool-level gates: approve only dangerous operations, agent runs autonomously between (§6.14) |
+| Dropping or queuing messages arriving during active runs | Bad UX or agent misses relevant context | Message steering: inject new messages into the active run at tool boundaries (§6.15) |
 
 > For infrastructure-level anti-patterns (auth, concurrency, security), see [INFRA_PATTERNS.md](./INFRA_PATTERNS.md#5-anti-patterns--pitfalls).
 
