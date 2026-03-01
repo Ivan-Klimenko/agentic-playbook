@@ -10,10 +10,12 @@ Agentic design patterns — how to structure, compose, and prompt agents.
 
 - **Architecture selection** — decision tree for ReAct, Router, Plan-and-Execute, Orchestrator-Worker, Swarm
 - **State management** — reducers, output schemas, minimal state surface
-- **Context engineering** — TODO anchoring, virtual filesystem, context offloading, sub-agent isolation, think tool, two-tier model strategy
+- **Agent design** — agents-as-config (no classes), mode switching via synthetic messages, parallel multi-tool (batch), two-tier model strategy
+- **Context engineering** — TODO anchoring, virtual filesystem, context offloading, sub-agent isolation, think tool, prompt caching, tool output truncation + file offloading, auto-continue after context recovery
 - **LangGraph snippets** — Command, InjectedState/InjectedToolArg, structured output, map-reduce, HITL, checkpointing, sub-agent registry factory, streaming
 - **Prompt engineering** — system prompt structure, tool descriptions, hard limits, scaling rules, composite assembly
-- **Anti-patterns** — 16 common pitfalls with fixes
+- **Production patterns** — prompt injection defense, dynamic prompt assembly, permission-as-data, fuzzy tool input resilience, prompt-driven plan execution
+- **Anti-patterns** — 38 common pitfalls with fixes
 
 ### [ORCHESTRATION_PATTERNS.md](./ORCHESTRATION_PATTERNS.md)
 

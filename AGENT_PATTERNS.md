@@ -99,7 +99,103 @@ Best format: structured text (XML tags, markdown sections). Keeps it parseable b
 
 **In framework code** (e.g., LangGraph), inject the working memory block by prepending it to the latest `HumanMessage` content before the LLM call, or as a separate content block within the same message. The prior conversation history remains untouched, preserving the cached prefix.
 
-### 2.6 Pre-processing & Shortcuts
+### 2.6 Agents-as-Config (No Agent Classes)
+
+Instead of building agent classes with behavior (methods, inheritance, state machines), define agents as **named configuration objects**. The runtime is generic — it interprets configs to assemble prompts, select tools, and enforce permissions.
+
+```typescript
+// Agent is a pure config — no execute(), no run(), no behavior
+AgentConfig = {
+  name: string,
+  mode: "primary" | "subagent" | "hidden",
+  prompt: string,             // system prompt (or use provider default)
+  permission: Ruleset,        // tool access rules (declarative)
+  model: { provider, id },    // optional model override
+  temperature: number,
+  steps: number,              // max agentic iterations
+}
+```
+
+**Built-in + custom parity:** Agents loaded from markdown frontmatter or JSON config use the same schema as built-in agents. Custom agents are first-class citizens, not second-class plugins.
+
+```markdown
+---
+mode: subagent
+temperature: 0.7
+model: openai/gpt-4o
+permission:
+  bash: deny
+  edit: { "*.test.ts": allow, "*": deny }
+---
+You are a code reviewer. Focus on test quality...
+```
+
+**Why configs, not classes:**
+- **Adding a new agent = adding a config file**, not writing code. Non-engineers can create agents.
+- **Runtime stays generic** — one loop handles all agents. Testing, debugging, and profiling apply uniformly.
+- **Composition via merging** — agent permissions merge with defaults and user overrides. No inheritance hierarchies.
+- **Hot-reloadable** — config changes take effect without restarting the runtime.
+
+**Hidden agents:** System agents (compaction, title generation, summarization) use the same schema with `hidden: true`. The runtime calls them programmatically, but they're configs like everything else.
+
+**When to use classes instead:** When agents need genuinely different execution strategies (graph topology, custom tool orchestration). But often what feels like "different behavior" is really "different config" — different tools, different prompts, different permissions.
+
+### 2.7 Agent Mode Switching via Synthetic Messages
+
+Switch between agents within the same session by injecting **synthetic user messages** with an agent field. The loop picks up the agent field on the next iteration and resolves the corresponding config. No graph rewiring, no state machine transitions.
+
+```
+Agent A (plan) working in session:
+  │
+  ├─ Agent calls mode_switch tool
+  │   ├─ Tool asks user for confirmation (optional)
+  │   └─ Creates synthetic user message:
+  │       { role: "user", agent: "build", text: "Mode approved. Execute the plan." }
+  │
+  ├─ Loop picks up synthetic message on next iteration:
+  │   agent = resolve(lastUserMessage.agent)  // "build"
+  │   tools = resolve(agent.permissions)       // full tool access
+  │   reminders = buildReminders(prevAgent → newAgent)
+  │
+  └─ Agent B (build) continues in same session with same history
+```
+
+**Why synthetic messages, not state transitions:**
+- **Conversation history preserved** — Agent B sees everything Agent A did (exploration, Q&A, reasoning)
+- **No special state machine** — the main loop already processes user messages; synthetic messages are just messages
+- **Auditable** — the mode switch appears in message history as a regular turn
+- **Prompt-injectable** — `insertReminders()` detects agent transitions and injects context-specific instructions (e.g., "you switched from plan to build, a plan file exists at X")
+
+**Common mode transitions:**
+- Plan → Build (read-only exploration → full edit access)
+- Build → Plan (user wants to step back and redesign)
+- Primary → Subagent (delegation via task tool — creates child session instead)
+
+### 2.8 Parallel Multi-Tool Execution (Batch Tool)
+
+Let the LLM request multiple independent tool calls in a single response, executed in parallel via `Promise.all()`. This cuts wall-clock time for parallel-safe operations (reading multiple files, searching multiple patterns).
+
+```
+Without batch:                        With batch:
+  LLM → read(a.ts)  → result          LLM → batch([
+  LLM → read(b.ts)  → result                  read(a.ts),
+  LLM → grep("TODO") → result                 read(b.ts),
+  3 sequential round-trips                     grep("TODO")
+                                             ]) → all results
+                                       1 round-trip, parallel execution
+```
+
+**Design decisions:**
+- **Disallow nesting** — batch inside batch is blocked (prevents exponential fan-out)
+- **Per-call permission checks** — each call within the batch gets independent permission evaluation
+- **Per-call state tracking** — each sub-call has its own lifecycle (running → completed/error) for UI streaming
+- **Aggregated result** — `"Batch execution (N/M successful)"` with per-call outputs concatenated
+
+**When to use:** Any agent with tools that are frequently called in parallel-safe sequences. Particularly effective for: file reading, code search, web fetching, API calls to independent endpoints.
+
+**When NOT to use:** When tool calls have dependencies (read result informs next edit) or when tools have side effects that could conflict (two edits to the same file).
+
+### 2.9 Pre-processing & Shortcuts
 
 Not every request needs the full agent loop. Add a lightweight pre-processing node before the LLM:
 - **Button/command detection**: exact text match → skip LLM entirely, call the right API directly
@@ -108,7 +204,7 @@ Not every request needs the full agent loop. Add a lightweight pre-processing no
 
 This saves latency and tokens for predictable inputs.
 
-### 2.7 Two-Tier Model Strategy
+### 2.10 Two-Tier Model Strategy
 
 Use different models for different cognitive loads within the same agent pipeline:
 
@@ -416,6 +512,58 @@ def agent_node(state):
 - **Anthropic**: Min cacheable prefix is 1024-4096 tokens (model-dependent). Up to 4 explicit breakpoints. 5-min TTL (refreshed on hit), optional 1-hour TTL at 2x cost. Cache reads = 10% of base input price.
 - **OpenAI**: Automatic prompt caching on all requests ≥1024 tokens. No explicit breakpoints — caching is fully automatic and prefix-based. No additional cost for cache writes.
 - **Google (Gemini)**: Supports explicit "cached content" objects that persist across requests with configurable TTL.
+
+### 3.8 Tool Output Truncation with File Offloading
+
+Tool outputs (file reads, search results, command output) can be arbitrarily large. Sending them verbatim into the conversation floods the context window. Truncate automatically and offload the full output to a retrievable location.
+
+**Pattern:**
+```
+Tool returns output (any size)
+  │
+  ├─ output ≤ threshold (e.g., 2000 lines / 50KB)?
+  │   YES → return as-is
+  │   NO  → truncate to threshold
+  │         save full output to temp file
+  │         append hint: "[Output truncated. Full output: /tmp/tool_output_abc123.txt]"
+  │         return truncated output + hint
+```
+
+**Key decisions:**
+- **Automatic, not opt-in** — applied by the `Tool.define()` wrapper so every tool gets truncation for free. Tool authors don't think about it.
+- **Dual threshold** — line count AND byte count. Prevents both "10K short lines" and "one 5MB line" from flooding context.
+- **Retrievable full output** — the LLM can read the temp file if it needs more. The hint tells it where to look.
+- **Temp file cleanup** — files expire after a TTL (e.g., 7 days) to prevent disk bloat.
+
+**Why not just summarize?** Summarization loses precision. For code search results, grep output, or error logs, the LLM often needs exact content — just not all of it at once. Truncation + file offloading preserves precision while protecting context.
+
+**Difference from §3.2 (virtual filesystem):** Virtual FS is agent-driven (the agent decides to save). Output truncation is framework-driven (happens automatically at the tool boundary). Both serve context protection, but truncation is a safety net while virtual FS is a strategy.
+
+### 3.9 Auto-Continue After Context Recovery
+
+When context compaction is triggered automatically (not by the user), inject a synthetic continuation message so the agent keeps working without manual intervention.
+
+```
+Agent working on multi-step task:
+  ... tool calls, reasoning, progress ...
+  │
+  ├─ Context overflow detected mid-stream
+  ├─ Compaction triggered → LLM summarizes conversation → summary replaces old messages
+  │
+  ├─ WITHOUT auto-continue:
+  │   Agent stops. User must manually say "continue."
+  │   Breaks flow. User may not notice for minutes.
+  │
+  └─ WITH auto-continue:
+      Inject synthetic user message:
+        "Continue if you have next steps, or stop and ask for
+         clarification if you are unsure how to proceed."
+      Agent resumes work seamlessly.
+```
+
+**Why it matters:** Context compaction is an infrastructure concern — the user shouldn't need to babysit it. The synthetic message gives the agent permission to continue while also providing an escape hatch ("stop if unsure") to prevent runaway behavior after context loss.
+
+**When NOT to auto-continue:** When compaction was user-initiated (they explicitly asked to reset/summarize). In that case, the user likely wants to steer the conversation, not have the agent barrel ahead.
 
 ---
 
@@ -1115,6 +1263,148 @@ When new messages arrive while an agent is actively processing, OpenClaw injects
 
 **When to use:** Multi-turn conversational agents where user messages arrive asynchronously. Not needed for batch/offline processing where inputs are known upfront.
 
+### 6.16 Permission-as-Data (Declarative Tool Access Control)
+
+Instead of hardcoded permission checks (`if agent === "plan" && tool === "edit" → deny`), use a **declarative ruleset** with three states and wildcard pattern matching.
+
+**Three states:**
+- `allow` — tool executes immediately
+- `deny` — tool throws error, LLM gets structured rejection
+- `ask` — pause for human approval (once / always / reject)
+
+**Ruleset structure:**
+```
+Rule = { permission: string, pattern: string, action: allow | deny | ask }
+Evaluation: last-match-wins with wildcard support
+```
+
+```typescript
+function evaluate(permission, pattern, ruleset) {
+  let result = { action: "ask" }  // default: ask user
+  for (const rule of ruleset) {
+    if (wildcard.match(rule.permission, permission) &&
+        wildcard.match(rule.pattern, pattern)) {
+      result = rule  // last match wins
+    }
+  }
+  return result
+}
+```
+
+**Composition via merging:**
+```
+defaults (built-in baseline)
+  + agent-specific rules (from agent config)
+    + user overrides (from user settings)
+      = final ruleset (last-match-wins within each layer)
+```
+
+**Example — plan agent restrictions:**
+```typescript
+permission = merge(
+  defaults,                         // everything allowed
+  fromConfig({
+    question: "allow",              // can ask user questions
+    plan_exit: "allow",             // can signal plan complete
+    edit: {
+      "*": "deny",                  // block ALL edits
+      ".plans/*.md": "allow",       // except plan files
+    },
+  }),
+  userOverrides,                    // user can relax/tighten
+)
+```
+
+**Why declarative:**
+- **New agent = new config**, not new permission code. Non-engineers can define agent boundaries.
+- **User-overridable** — users can relax or tighten permissions per agent without code changes.
+- **Auditable** — the merged ruleset is inspectable data, not scattered `if` statements.
+- **Consistent** — same system for agents, users, and plugins. One evaluation function handles all.
+
+**The "ask" state** creates a real-time approval flow: the tool pauses, publishes an event (displayed as a permission dialog in the UI), and resumes when the user responds with "once" (this call only), "always" (add to approved ruleset), or "reject" (deny all pending for this session).
+
+### 6.17 Fuzzy Tool Input Resilience (Fallback Matching)
+
+LLMs are imprecise about whitespace, indentation, escape characters, and exact string reproduction. When a tool requires exact matching (e.g., find-and-replace in a file), don't fail on the first mismatch — use a **fallback chain of increasingly fuzzy matchers**.
+
+**Pattern — generator-based fallback chain:**
+```
+Tool receives (old_string, new_string, file_content):
+  │
+  ├─ Strategy 1: Exact string match
+  ├─ Strategy 2: Line-by-line whitespace-trimmed
+  ├─ Strategy 3: First/last line anchors + body similarity
+  ├─ Strategy 4: Whitespace-normalized
+  ├─ Strategy 5: Indentation-agnostic
+  ├─ Strategy 6: Escape sequence normalization
+  ├─ Strategy 7: Trimmed content boundaries
+  ├─ Strategy 8: Context-aware (context lines + >50% body similarity)
+  └─ Strategy 9: Multi-occurrence (for replace-all operations)
+
+  First strategy that produces exactly ONE unique match wins.
+  Multiple matches → try next strategy (ambiguity is worse than no match).
+```
+
+**Why generators:**
+```typescript
+// Each strategy is a generator yielding candidate match strings
+function* whitespaceNormalized(needle, haystack) {
+  const normalized = normalize(needle)
+  for (const candidate of findCandidates(haystack)) {
+    if (normalize(candidate) === normalized) yield candidate
+  }
+}
+
+// First unique match from any strategy wins
+for (const strategy of strategies) {
+  const matches = [...strategy(oldString, fileContent)]
+  if (matches.length === 1) return applyEdit(matches[0], newString)
+}
+```
+
+- Lazy evaluation — expensive strategies only run if cheap ones fail
+- Each strategy independently validates uniqueness (single match)
+- New strategies can be added to the chain without modifying existing ones
+
+**Impact:** In practice, this takes edit tool success rate from ~80% (exact match only) to ~98% (with fuzzy chain). The LLM hallucinates whitespace frequently, but the semantic intent is usually correct.
+
+**When to apply this pattern:** Any tool where the LLM must reproduce exact content from memory (find-and-replace, patch application, code insertion at specific locations). Less relevant for tools with structured parameters (API calls, file paths).
+
+### 6.18 Prompt-Driven Plan Execution (No Engine)
+
+An alternative to formal plan-and-execute architectures: use **prompt injection and convention** to drive plan execution, with no plan parser, step tracker, or execution engine.
+
+```
+Plan phase:
+  Plan agent explores codebase, writes plan to a markdown file
+  Plan agent calls plan_exit → synthetic message switches to build agent
+
+Execution phase:
+  Build agent receives: "A plan file exists at {path}. Execute it."
+  Build agent reads the plan file with the read tool
+  Build agent follows the plan using standard tools
+  Build agent tracks progress via TodoWrite (optional, prompt-guided)
+```
+
+**What makes this work:**
+1. **The plan is a regular file** — markdown, no schema, no structured format. The LLM writes natural language.
+2. **Execution is just "read file, follow instructions"** — the build agent already knows how to use tools. The plan file is just context.
+3. **TodoWrite provides progress tracking** — the agent creates a task list from plan steps and marks items complete as it works. This is prompt-guided, not enforced.
+4. **The user sees the plan** — it's a readable markdown file, not an internal data structure.
+
+**Tradeoffs vs. structured plan-and-execute:**
+| | Prompt-driven | Structured engine |
+|---|---|---|
+| Plan format | Free-form markdown | Schema-enforced steps |
+| Step tracking | Optional (TodoWrite) | Built-in state machine |
+| Verification | Prompt-guided | Programmatic assertions |
+| Flexibility | Agent adapts freely | Steps execute in order |
+| Debuggability | Read the plan file | Inspect step execution state |
+
+**When prompt-driven works:** When the LLM is capable enough to follow a written plan reliably (frontier models). When plans need human readability. When rigid step ordering would be too constraining.
+
+**When you need a structured engine:** When plans must execute in exact order. When step failures need programmatic fallbacks. When plan compliance must be verified mechanically (audit requirements).
+
 ---
 
 ## 7. Anti-Patterns & Pitfalls
@@ -1134,7 +1424,7 @@ When new messages arrive while an agent is actively processing, OpenClaw injects
 | No context anchoring on long tasks | Agent drifts from objectives after ~50 tool calls (context rot) | TODO write-read-reflect cycle (§3.1) |
 | Raw tool results in messages | Token-heavy content fills context, displaces reasoning | Context offloading: content → files, summaries → messages (§3.2) |
 | Sub-agents inherit parent context | Context clash, confusion, poisoning from irrelevant history | Replace messages with task-only context (§3.4) |
-| Same model for all cognitive loads | Expensive model wasted on summarization/formatting | Two-tier: cheap model for extraction, expensive for reasoning (§2.7) |
+| Same model for all cognitive loads | Expensive model wasted on summarization/formatting | Two-tier: cheap model for extraction, expensive for reasoning (§2.10) |
 | No structured reflection checkpoints | Agent makes impulsive decisions on complex multi-step tasks | think_tool forces articulated reasoning (§3.6) |
 | Generic error strings from tools | LLM can't self-correct without knowing valid options | Include valid values and retry hints in error messages (§2.4) |
 | Editing/reordering earlier messages between turns | Invalidates prompt cache, re-processes entire context at full cost | Append-only context: add new messages, never modify old ones (§3.7) |
@@ -1153,6 +1443,14 @@ When new messages arrive while an agent is actively processing, OpenClaw injects
 | Mixing retry/recovery logic with tool execution loop | Spaghetti error handling, hard to test and reason about | Dual-loop: outer loop for retry/failover, inner loop for tool execution (§6.13) |
 | Whole-run approval gates for HITL | Agent loses reasoning continuity, adds latency to every run | Tool-level gates: approve only dangerous operations, agent runs autonomously between (§6.14) |
 | Dropping or queuing messages arriving during active runs | Bad UX or agent misses relevant context | Message steering: inject new messages into the active run at tool boundaries (§6.15) |
+| Agent classes with behavior methods | Tight coupling, hard to compose, can't add agents without code | Agents-as-config: named config objects, generic runtime (§2.6) |
+| State machine for agent mode transitions | Over-engineered, hard to debug, special state management | Synthetic messages with agent field — the loop already processes messages (§2.7) |
+| Sequential tool calls for independent operations | Unnecessary latency — N round-trips instead of 1 | Batch tool: parallel execution via Promise.all with per-call state tracking (§2.8) |
+| Unbounded tool output in context | Large outputs flood context, displace reasoning | Auto-truncate at threshold + offload full output to temp file with retrieval hint (§3.8) |
+| Agent stops after context compaction | User must manually say "continue" — breaks autonomous flow | Auto-continue: inject synthetic "continue or stop if unsure" message (§3.9) |
+| Hardcoded permission checks per agent | Every new agent or tool needs new permission code | Declarative rulesets with wildcard matching + three states + composition (§6.16) |
+| Exact-match-only for tool inputs | LLM whitespace/indentation hallucinations cause ~20% failure rate | Fuzzy fallback chain: 9 strategies from exact to context-aware similarity (§6.17) |
+| Building a plan execution engine | Over-engineering for most cases; rigid step ordering limits LLM flexibility | Prompt-driven: agent reads plan file and follows it, TodoWrite for tracking (§6.18) |
 
 > For infrastructure-level anti-patterns (auth, concurrency, security), see [INFRA_PATTERNS.md](./INFRA_PATTERNS.md#5-anti-patterns--pitfalls).
 
@@ -1177,6 +1475,10 @@ When new messages arrive while an agent is actively processing, OpenClaw injects
 - [ReAct: Synergizing Reasoning and Acting](https://arxiv.org/abs/2210.03629) — the foundational pattern
 - [Plan-and-Solve Prompting](https://arxiv.org/abs/2305.04091) — planning before execution
 - [Anthropic: Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents) — practical patterns from production
+
+### Architecture Deep-Dives
+- [OpenCode Architecture](./solutions_architecture/OPENCODE_ARCHITECTURE.md) — agents-as-config, fuzzy edit matching, permission-as-data, prompt-driven planning, batch tool, snapshot/revert (§2.6–2.8, §3.8–3.9, §6.16–6.18)
+- [OpenClaw Architecture](./solutions_architecture/OPENCLAW_ARCHITECTURE.md) — multi-channel agent platform, tool policy pipeline, auth failover, dual-loop, HITL (§6.1–6.15)
 
 ### Tutorials
 - [deep-agents-from-scratch](../deep-agents-from-scratch/) — progressive tutorial: TODO anchoring → virtual filesystem → sub-agents → full research agent
