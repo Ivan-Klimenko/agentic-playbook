@@ -6,16 +6,55 @@ A practitioner's reference for building LLM-powered agents. Framework-agnostic p
 
 ### [AGENT_PATTERNS.md](./AGENT_PATTERNS.md)
 
-Agentic design patterns — how to structure, compose, and prompt agents.
+Core agentic design patterns — framework-agnostic, applicable to any agent system.
 
 - **Architecture selection** — decision tree for ReAct, Router, Plan-and-Execute, Orchestrator-Worker, Swarm
 - **State management** — reducers, output schemas, minimal state surface
-- **Agent design** — agents-as-config (no classes), mode switching via synthetic messages, parallel multi-tool (batch), two-tier model strategy
+- **Agent design** — agents-as-config (no classes), mode switching via synthetic messages, parallel multi-tool (batch), two-tier model strategy, no-plan architecture, pure LLM tool selection, fuzzy input resilience, prompt-driven plan execution
 - **Context engineering** — TODO anchoring, virtual filesystem, context offloading, sub-agent isolation, think tool, prompt caching, tool output truncation + file offloading, auto-continue after context recovery
-- **LangGraph snippets** — Command, InjectedState/InjectedToolArg, structured output, map-reduce, HITL, checkpointing, sub-agent registry factory, streaming
 - **Prompt engineering** — system prompt structure, tool descriptions, hard limits, scaling rules, composite assembly
-- **Production patterns** — prompt injection defense, dynamic prompt assembly, permission-as-data, fuzzy tool input resilience, prompt-driven plan execution
-- **Anti-patterns** — 38 common pitfalls with fixes
+
+### [LANGGRAPH_PATTERNS.md](./LANGGRAPH_PATTERNS.md)
+
+LangGraph-specific implementation patterns and code snippets.
+
+- **State & reducers** — output schemas, reducer types
+- **ReAct loop wiring** — agent ↔ tools ↔ conditional edges
+- **Command** — cross-graph state updates, routing with goto
+- **Injection** — InjectedState, InjectedToolCallId, InjectedToolArg
+- **Structured output** — Pydantic schemas with error handling
+- **Map-Reduce** — Send API for parallel fan-out
+- **Human-in-the-loop** — interrupt() + checkpointer resume
+- **Sub-agents** — sub-graph as tool, registry factory, streaming
+
+### [PRODUCTION_PATTERNS.md](./PRODUCTION_PATTERNS.md)
+
+Battle-tested agentic patterns for agents receiving untrusted input at scale.
+
+- **Prompt injection defense** — 4-layer sanitize + detect + wrap + normalize
+- **Dynamic system prompt assembly** — conditional sections, prompt modes (full/minimal/none)
+- **Skill discovery & token budget** — multi-source discovery, configurable limits
+- **Tool visibility & ordering** — canonical order, dynamic descriptions
+- **Thinking block management** — strip, preserve empty turns, multi-level config
+- **Tool result sanitization** — details stripping, semantic command summarization
+- **Response output directives** — inline reply-to, media, silence
+- **Untrusted context separation** — explicit labeling of external metadata
+- **Conditional memory instructions** — matched to tool availability
+- **Tool loop detection** — pattern-based (repeat, poll, ping-pong) + corrective messages
+- **Dual-loop architecture** — retry/recovery outer loop + tool execution inner loop
+- **HITL as tool-level gate** — per-call approval, not whole-run
+- **Message steering** — real-time injection into active runs
+- **Permission-as-data** — declarative rulesets with three states + wildcard matching
+
+### [ANTI_PATTERNS.md](./ANTI_PATTERNS.md)
+
+40 common pitfalls when building agents, organized by category with cross-references to fixes.
+
+- **Architecture & composition** (11 pitfalls)
+- **Context management** (12 pitfalls)
+- **Tool design** (7 pitfalls)
+- **Prompt engineering** (6 pitfalls)
+- **Security & permissions** (4 pitfalls)
 
 ### [ORCHESTRATION_PATTERNS.md](./ORCHESTRATION_PATTERNS.md)
 
