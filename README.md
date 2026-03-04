@@ -80,6 +80,19 @@ Production infrastructure for agent platforms — extracted from [OpenClaw](./so
 - **Defense-in-depth security** (9-layer stack)
 - **Channel plugin architecture** (modular adapters)
 
+### [PROJECT_INSPECTION.md](./PROJECT_INSPECTION.md)
+
+Structured checklist for reverse-engineering a new agentic codebase.
+
+- **Architecture & Agent Topology** — hierarchy, instantiation, communication, lifecycle, delegation logic
+- **Context Management** — splitting, isolation, history, shared vs private state, token budget, long-running flows
+- **Planning & Execution** — planning phase, plan schema, injection, execution tracking, re-planning, completion verification
+- **Thinking & Reasoning** — think step, implementation, visibility, tool selection, post-execution reflection
+- **Tool System** — definition, registration, selection, parallel execution, error recovery, meta-tools
+- **Flow Control & Error Handling** — core loop, iteration limits, termination, failure handling, HITL, cost tracking
+- **State & Persistence** — state schema, mutability, memory tiers, state passing, checkpointing, result accumulation
+- **Inspection workflow** — recommended analysis order with practical steps
+
 ### [solutions_architecture/](./solutions_architecture/)
 
 - [OPENCLAW_ARCHITECTURE.md](./solutions_architecture/OPENCLAW_ARCHITECTURE.md) — full architecture deep-dive of a production agent orchestration platform
@@ -90,7 +103,7 @@ Production infrastructure for agent platforms — extracted from [OpenClaw](./so
 TypeScript implementations of the infrastructure patterns:
 
 ```
-code_snippets/OpenClaw/
+code_snippets/openclaw/
   auth_failover.ts
   tool_policy_pipeline.ts
   subagent_depth_policy.ts
@@ -99,7 +112,7 @@ code_snippets/OpenClaw/
   hybrid_memory_search.ts
   sandbox_security.ts
 
-code_snippets/OpenCode/
+code_snippets/opencode/
   agent_definition.ts       — agent-as-config schema, permission merging, custom agent loading
   subagent_invocation.ts    — Task tool gateway, child session isolation, resumable tasks
   context_compaction.ts     — 3-stage context recovery (prune, summarize, auto-continue)
