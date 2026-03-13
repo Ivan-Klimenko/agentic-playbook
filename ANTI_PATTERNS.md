@@ -1,6 +1,6 @@
 # Anti-Patterns & Pitfalls
 
-38 common mistakes when building LLM-powered agents, with fixes. Cross-referenced to the relevant pattern documents.
+44 common mistakes when building LLM-powered agents, with fixes. Cross-referenced to the relevant pattern documents.
 
 > **See also:** [AGENT_PATTERNS.md](./AGENT_PATTERNS.md) | [PRODUCTION_PATTERNS.md](./PRODUCTION_PATTERNS.md) | [INFRA_PATTERNS.md](./INFRA_PATTERNS.md) | [LANGGRAPH_PATTERNS.md](./LANGGRAPH_PATTERNS.md)
 
@@ -21,6 +21,10 @@
 | 9 | Formal plan-and-execute for every agent | Doubles latency for simple conversational tasks | No-plan architecture for short interactions; add TODO tool incrementally ([AGENT_PATTERNS §2.11](./AGENT_PATTERNS.md#211-no-plan-architecture-planning-via-system-prompt)) |
 | 10 | Building a plan execution engine | Over-engineering for most cases; rigid step ordering limits LLM flexibility | Prompt-driven: agent reads plan file and follows it ([AGENT_PATTERNS §2.14](./AGENT_PATTERNS.md#214-prompt-driven-plan-execution-no-engine)) |
 | 11 | Mixing retry/recovery logic with tool execution loop | Spaghetti error handling, hard to test and reason about | Dual-loop: outer for retry/failover, inner for tool execution ([PRODUCTION_PATTERNS §11](./PRODUCTION_PATTERNS.md#11-dual-loop-architecture-retry-vs-tool-execution)) |
+| 12 | Storing derived/formatted data in graph state | State bloat, stale data, can't format differently per node | Store raw data, derive on read ([LANGGRAPH_PATTERNS §2](./LANGGRAPH_PATTERNS.md#2-state-design-principles)) |
+| 13 | One fat node with mixed external calls | Single failure kills entire step, can't retry selectively, no mid-node checkpoint | Split by service/failure mode ([LANGGRAPH_PATTERNS §3](./LANGGRAPH_PATTERNS.md#3-node-granularity)) |
+| 14 | No retry policy on nodes calling external services | Transient network/rate-limit errors crash the graph | Add `RetryPolicy` per node ([LANGGRAPH_PATTERNS §16](./LANGGRAPH_PATTERNS.md#16-error-handling-strategies)) |
+| 15 | Side effects before `interrupt()` | Code before interrupt re-runs on every resume — duplicate notifications, double writes | Place `interrupt()` at top of node ([LANGGRAPH_PATTERNS §13](./LANGGRAPH_PATTERNS.md#13-human-in-the-loop-with-interrupt)) |
 
 ## Context Management
 
@@ -43,7 +47,7 @@
 
 | # | Anti-pattern | Why it's bad | Fix |
 |---|---|---|---|
-| 24 | Manual JSON parsing of LLM output | Fragile, error-prone, prompt overhead for format examples | Use structured output with Pydantic ([LANGGRAPH_PATTERNS §6](./LANGGRAPH_PATTERNS.md#6-structured-output-with-pydantic)) |
+| 24 | Manual JSON parsing of LLM output | Fragile, error-prone, prompt overhead for format examples | Use structured output with Pydantic ([LANGGRAPH_PATTERNS §10](./LANGGRAPH_PATTERNS.md#10-structured-output-with-pydantic)) |
 | 25 | Tool returns raw exception | LLM can't recover gracefully | Return structured error in ToolMessage ([AGENT_PATTERNS §2.4](./AGENT_PATTERNS.md#24-error-boundaries--graceful-degradation)) |
 | 26 | Generic error strings from tools | LLM can't self-correct without knowing valid options | Include valid values and retry hints in error messages ([AGENT_PATTERNS §2.4](./AGENT_PATTERNS.md#24-error-boundaries--graceful-degradation)) |
 | 27 | Stateless analysis across calls | Agent forgets prior work in multi-turn sessions | Add a scratchpad/memo persisted in parent state |
@@ -55,7 +59,7 @@
 
 | # | Anti-pattern | Why it's bad | Fix |
 |---|---|---|---|
-| 31 | Amending prompts for structured output format | Redundant with schema, can conflict | Let Pydantic model define the format ([LANGGRAPH_PATTERNS §6](./LANGGRAPH_PATTERNS.md#6-structured-output-with-pydantic)) |
+| 31 | Amending prompts for structured output format | Redundant with schema, can conflict | Let Pydantic model define the format ([LANGGRAPH_PATTERNS §10](./LANGGRAPH_PATTERNS.md#10-structured-output-with-pydantic)) |
 | 32 | Same model for all cognitive loads | Expensive model wasted on summarization/formatting | Two-tier: cheap model for extraction, expensive for reasoning ([AGENT_PATTERNS §2.10](./AGENT_PATTERNS.md#210-two-tier-model-strategy)) |
 | 33 | Monolithic system prompt | Sub-agents get irrelevant sections, wasted context | Conditional sections + prompt modes: full/minimal/none ([PRODUCTION_PATTERNS §2](./PRODUCTION_PATTERNS.md#2-dynamic-system-prompt-assembly-conditional-sections)) |
 | 34 | Dumping all skills into prompt | Token bloat, LLM overwhelmed by 150+ skill descriptions | Token budget caps + on-demand reading via tool ([PRODUCTION_PATTERNS §3](./PRODUCTION_PATTERNS.md#3-skill-discovery-filtering--token-budget)) |
