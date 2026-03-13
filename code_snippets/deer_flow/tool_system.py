@@ -1,0 +1,91 @@
+"""
+DeerFlow Tool System
+
+Multi-source tool composition: config-based (YAML + reflection), built-in,
+and MCP servers. Tools are filtered per agent/subagent based on model
+capabilities (vision), runtime flags (subagent_enabled), and per-agent
+tool_groups from config.
+
+Source: backend/src/tools/tools.py, backend/src/mcp/cache.py
+"""
+
+# --- Built-in Tools ---
+# Always available to the lead agent. Subagents get a filtered subset.
+
+BUILTIN_TOOLS = [present_file_tool, ask_clarification_tool]
+SUBAGENT_TOOLS = [task_tool]  # only included when subagent_enabled=True
+
+
+# --- Tool Composition ---
+# Three sources merged: config-based, built-in, MCP.
+
+def get_available_tools(
+    groups: list[str] | None = None,   # per-agent tool_groups filter
+    include_mcp: bool = True,
+    model_name: str | None = None,
+    subagent_enabled: bool = False,
+) -> list[BaseTool]:
+    config = get_app_config()
+
+    # 1. Config-based tools: loaded via reflection from config.yaml
+    #    Each tool entry: {name, group, use: "src.sandbox.tools:bash_tool"}
+    loaded_tools = [
+        resolve_variable(tool.use, BaseTool)
+        for tool in config.tools
+        if groups is None or tool.group in groups
+    ]
+
+    # 2. MCP tools: cached globally, staleness-checked via config file mtime
+    mcp_tools = []
+    if include_mcp:
+        extensions_config = ExtensionsConfig.from_file()  # always reads latest from disk
+        if extensions_config.get_enabled_mcp_servers():
+            mcp_tools = get_cached_mcp_tools()
+
+    # 3. Built-in tools: conditionally includes subagent + vision tools
+    builtin = BUILTIN_TOOLS.copy()
+    if subagent_enabled:
+        builtin.extend(SUBAGENT_TOOLS)
+
+    model_config = config.get_model_config(model_name)
+    if model_config and model_config.supports_vision:
+        builtin.append(view_image_tool)
+
+    return loaded_tools + builtin + mcp_tools
+
+
+# --- MCP Tool Caching ---
+# Global cache with asyncio.Lock for thread-safe lazy initialization.
+# Staleness detected by checking extensions_config.yaml modification time.
+
+_mcp_tools_cache: list[BaseTool] | None = None
+_mcp_tools_lock = asyncio.Lock()
+_config_mtime: float | None = None
+
+async def _load_mcp_tools() -> list[BaseTool]:
+    """Lazy-loads MCP tools from all enabled servers."""
+    async with _mcp_tools_lock:
+        current_mtime = extensions_config_path.stat().st_mtime
+        if _mcp_tools_cache is not None and _config_mtime == current_mtime:
+            return _mcp_tools_cache  # cache hit
+
+        # Cache miss or stale: reload from MCP servers
+        tools = await get_mcp_tools()  # uses langchain-mcp-adapters
+        _mcp_tools_cache = tools
+        _config_mtime = current_mtime
+        return tools
+
+
+# --- Subagent Tool Filtering ---
+# Subagents inherit parent tools minus denied tools (no nesting).
+
+def _filter_tools(all_tools, allowed, disallowed) -> list[BaseTool]:
+    filtered = all_tools
+    if allowed is not None:
+        filtered = [t for t in filtered if t.name in set(allowed)]
+    if disallowed is not None:
+        filtered = [t for t in filtered if t.name not in set(disallowed)]
+    return filtered
+
+# Default disallowed for subagents:
+# ["task", "ask_clarification", "present_files"] → no nesting, no HITL, no artifacts
