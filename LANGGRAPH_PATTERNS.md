@@ -25,9 +25,11 @@ graph = StateGraph(OrchestratorState, output_schema=OrchestratorOutput)
 ## 2. ReAct Loop Wiring
 
 ```python
+from langgraph.prebuilt import tools_condition, ToolNode
+
 graph.add_node("agent", agent_node)
 graph.add_node("tools", ToolNode(ALL_TOOLS))
-graph.set_entry_point("agent")
+graph.add_edge(START, "agent")
 graph.add_conditional_edges("agent", tools_condition, {
     "tools": "tools",
     "done": "response_formatter",
@@ -35,6 +37,8 @@ graph.add_conditional_edges("agent", tools_condition, {
 graph.add_edge("tools", "agent")  # the loop
 graph.add_edge("response_formatter", END)
 ```
+
+> **When to use `add_conditional_edges` vs `Command`:** Use `add_conditional_edges` for pure routing that doesn't need to update state (like this ReAct check). Use `Command(update=..., goto=...)` when you need to **update state and route in a single atomic step** (see §4). Don't mix both on the same node — `Command` adds dynamic edges, but any static edges from `add_edge` on that node **still fire alongside** the `Command` route.
 
 ## 3. Command: Cross-Graph State Updates from Tools
 
@@ -54,6 +58,8 @@ async def call_sub_agent(task: str,
 
 ## 4. Command with Routing (goto)
 
+`Command` combines state update + routing in one atomic step, eliminating the need for `add_conditional_edges` on that node:
+
 ```python
 def review_node(state) -> Command[Literal["approve", "reject"]]:
     decision = interrupt({"draft": state["draft"], "message": "Approve?"})
@@ -61,6 +67,8 @@ def review_node(state) -> Command[Literal["approve", "reject"]]:
         return Command(update={"approved": True}, goto="approve")
     return Command(update={"approved": False}, goto="reject")
 ```
+
+> **Caveat:** The `Command[Literal[...]]` return type annotation is **required** — LangGraph uses it to discover possible destinations for graph rendering. Also note that `Command` only adds *dynamic* edges; any `add_edge` calls on the same source node will still execute, potentially causing duplicate transitions.
 
 ## 5. InjectedState, InjectedToolCallId & InjectedToolArg
 
@@ -117,6 +125,9 @@ class State(TypedDict):
 def fan_out(state: State) -> list[Send]:
     return [Send("process", {"topic": t}) for t in state["topics"]]
 
+# Note: add_conditional_edges is reused here for fan-out (not routing).
+# When the function returns list[Send], it spawns parallel node instances
+# instead of choosing a single destination.
 builder.add_conditional_edges(START, fan_out)
 ```
 
@@ -145,18 +156,23 @@ result = graph.invoke(Command(resume="yes"), config)
 ## 9. Checkpointing & Persistence
 
 ```python
-# In-memory (dev/testing)
+# In-memory (dev/testing) — built into langgraph
 from langgraph.checkpoint.memory import InMemorySaver
 graph = builder.compile(checkpointer=InMemorySaver())
 
-# SQLite (single-process persistence)
-from langgraph.checkpoint.sqlite import SqliteSaver
-graph = builder.compile(checkpointer=SqliteSaver(conn))
+# SQLite (single-process persistence) — pip install langgraph-checkpoint-sqlite
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+async with AsyncSqliteSaver.from_conn_string("checkpoints.db") as saver:
+    graph = builder.compile(checkpointer=saver)
 
-# Postgres (production, multi-process)
-from langgraph.checkpoint.postgres import PostgresSaver
-graph = builder.compile(checkpointer=PostgresSaver(conn_string))
+# Postgres (production, multi-process) — pip install langgraph-checkpoint-postgres
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+async with AsyncPostgresSaver.from_conn_string(conn_string) as saver:
+    await saver.setup()  # create tables on first run
+    graph = builder.compile(checkpointer=saver)
 ```
+
+> **Note:** SQLite and Postgres checkpointers live in separate packages (`langgraph-checkpoint-sqlite`, `langgraph-checkpoint-postgres`), not in the core `langgraph` package.
 
 Every `invoke()` with a `thread_id` saves state. Resume any thread, even after process restart (with durable checkpointer).
 
