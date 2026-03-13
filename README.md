@@ -64,7 +64,7 @@ Multi-agent orchestration topologies — how to wire agents together. Adapted fr
 
 ### [INFRA_PATTERNS.md](./INFRA_PATTERNS.md)
 
-Production infrastructure for agent platforms — extracted from [OpenClaw](./solutions_architecture/OPENCLAW_ARCHITECTURE.md) (628K-LOC TypeScript).
+Production infrastructure for agent platforms — extracted from [OpenClaw](./inspections/openclaw.md) (628K-LOC TypeScript).
 
 - **Auth profile failover** with cooldown rotation
 - **7-layer tool policy pipeline** (profile, provider, global, agent, group)
@@ -90,17 +90,20 @@ Structured checklist for reverse-engineering a new agentic codebase.
 - **State & Persistence** — state schema, mutability, memory tiers, state passing, checkpointing, result accumulation
 - **Inspection workflow** — recommended analysis order with practical steps
 
-### [solutions_architecture/](./solutions_architecture/)
+### [inspections/](./inspections/)
 
-- [OPENCLAW_ARCHITECTURE.md](./solutions_architecture/OPENCLAW_ARCHITECTURE.md) — full architecture deep-dive of a production agent orchestration platform
-- [OPENCODE_ARCHITECTURE.md](./solutions_architecture/OPENCODE_ARCHITECTURE.md) — full architecture deep-dive of OpenCode (open-source AI coding agent, ~100K-LOC TypeScript)
+Project-level architecture deep-dives and codebase inspections (following [PROJECT_INSPECTION.md](./PROJECT_INSPECTION.md) checklist):
+
+- [openclaw.md](./inspections/openclaw.md) — production agent orchestration platform (628K-LOC TypeScript, 50+ messaging channels)
+- [opencode.md](./inspections/opencode.md) — open-source AI coding agent (~100K-LOC TypeScript)
+- [deer_flow.md](./inspections/deer_flow.md) — super agent harness with middleware chain, subagent executor, LLM-powered memory (Python, LangGraph)
 
 ### [code_snippets/](./code_snippets/)
 
-TypeScript implementations of the infrastructure patterns:
+Implementation patterns extracted from inspected projects:
 
 ```
-code_snippets/openclaw/
+code_snippets/openclaw/          (TypeScript)
   auth_failover.ts
   tool_policy_pipeline.ts
   subagent_depth_policy.ts
@@ -109,7 +112,7 @@ code_snippets/openclaw/
   hybrid_memory_search.ts
   sandbox_security.ts
 
-code_snippets/opencode/
+code_snippets/opencode/          (TypeScript)
   agent_definition.ts       — agent-as-config schema, permission merging, custom agent loading
   subagent_invocation.ts    — Task tool gateway, child session isolation, resumable tasks
   context_compaction.ts     — 3-stage context recovery (prune, summarize, auto-continue)
@@ -118,14 +121,23 @@ code_snippets/opencode/
   instance_context.ts       — AsyncLocalStorage isolation, per-directory state, monotonic IDs
   snapshot_revert.ts        — git-based filesystem snapshots, per-file revert, full restore
   event_bus_sse.ts          — typed event bus, global cross-instance streaming, SSE + 16ms batching
+
+code_snippets/deer_flow/         (Python)
+  agent_factory.py           — dynamic agent creation, ThreadState schema, middleware composition
+  subagent_executor.py       — two-pool background execution, polling bridge, SSE events
+  middleware_chain.py        — error→ToolMessage, clarification interrupt, concurrency truncation
+  memory_system.py           — LLM-powered persistent memory, confidence-scored facts, token budgeting
+  tool_system.py             — multi-source tool composition (config + built-in + MCP), caching
+  prompt_engineering.py      — dynamic prompt assembly, CLARIFY→PLAN→ACT, progressive skill loading
 ```
 
 ## Sources
 
 Patterns are drawn from:
 
-- Production work on [OpenClaw](./solutions_architecture/OPENCLAW_ARCHITECTURE.md) (multi-channel agent platform)
-- Architecture analysis of [OpenCode](./solutions_architecture/OPENCODE_ARCHITECTURE.md) (open-source AI coding agent)
+- Production work on [OpenClaw](./inspections/openclaw.md) (multi-channel agent platform)
+- Architecture analysis of [OpenCode](./inspections/opencode.md) (open-source AI coding agent)
+- Architecture analysis of [DeerFlow](./inspections/deer_flow.md) (super agent harness, LangGraph middleware chain)
 - [deep-agents-from-scratch](https://github.com/) tutorials (TODO anchoring, virtual FS, context offloading, sub-agents)
 - [Anthropic: Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents)
 - [LangGraph](https://github.com/langchain-ai/langgraph) docs and patterns
