@@ -837,8 +837,8 @@ Instruct parallel execution explicitly: *"When you identify multiple independent
 - [Anthropic: Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents) — practical patterns from production
 
 ### Architecture Deep-Dives
-- [OpenCode Architecture](./solutions_architecture/OPENCODE_ARCHITECTURE.md) — agents-as-config, fuzzy edit matching, permission-as-data, prompt-driven planning, batch tool, snapshot/revert
-- [OpenClaw Architecture](./solutions_architecture/OPENCLAW_ARCHITECTURE.md) — multi-channel agent platform, tool policy pipeline, auth failover, dual-loop, HITL
+- [OpenCode Architecture](./inspections/opencode.md) — agents-as-config, fuzzy edit matching, permission-as-data, prompt-driven planning, batch tool, snapshot/revert
+- [OpenClaw Architecture](./inspections/openclaw.md) — multi-channel agent platform, tool policy pipeline, auth failover, dual-loop, HITL
 - [DeerFlow Inspection](./inspections/deer_flow.md) — middleware chain architecture, subagent executor with background pools, memory system with upload scrubbing, post-model guardrails
 
 ### Tutorials

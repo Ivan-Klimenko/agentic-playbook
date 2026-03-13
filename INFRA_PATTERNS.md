@@ -2,7 +2,7 @@
 
 Production patterns for agent platforms — auth, security, concurrency, memory, and plugin systems. Extracted from OpenClaw (628K-LOC agent orchestration platform).
 
-> See [OPENCLAW_ARCHITECTURE.md](./OPENCLAW_ARCHITECTURE.md) for full architecture documentation.
+> See [openclaw.md](./inspections/openclaw.md) for full architecture documentation.
 > See [code_snippets/](./code_snippets/) for TypeScript implementations.
 > See [AGENT_PATTERNS.md](./AGENT_PATTERNS.md) for agentic design patterns (architecture, state, prompts, LangGraph).
 
@@ -284,5 +284,5 @@ ChannelPlugin = {
 ## 12. References
 
 ### Architecture Case Studies
-- [OPENCLAW_ARCHITECTURE.md](./solutions_architecture/OPENCLAW_ARCHITECTURE.md) — deep-dive into OpenClaw's agentic architecture (gateway, tool policies, sub-agents, memory, security)
+- [openclaw.md](./inspections/openclaw.md) — deep-dive into OpenClaw's agentic architecture (gateway, tool policies, sub-agents, memory, security)
 - [code_snippets/](./code_snippets/openclaw/) — TypeScript implementations of production patterns from OpenClaw

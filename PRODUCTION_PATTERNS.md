@@ -1,6 +1,6 @@
 # Production Agentic Patterns
 
-Battle-tested patterns for agents receiving untrusted input at scale. Extracted from [OpenClaw](./solutions_architecture/OPENCLAW_ARCHITECTURE.md) (628K-LOC, 50+ messaging channels) and [OpenCode](./solutions_architecture/OPENCODE_ARCHITECTURE.md).
+Battle-tested patterns for agents receiving untrusted input at scale. Extracted from [OpenClaw](./inspections/openclaw.md) (628K-LOC, 50+ messaging channels) and [OpenCode](./inspections/opencode.md).
 
 > **See also:** [AGENT_PATTERNS.md](./AGENT_PATTERNS.md) for foundational design principles | [INFRA_PATTERNS.md](./INFRA_PATTERNS.md) for infrastructure (auth, security, concurrency) | [ANTI_PATTERNS.md](./ANTI_PATTERNS.md) for pitfalls checklist
 
