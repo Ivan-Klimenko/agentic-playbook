@@ -28,25 +28,24 @@ Analyze the agent/sub-agent architecture of the codebase.
 
 ---
 
-## 2. Context Management
+## 2. Thinking & Reasoning
 
-How the codebase manages context across agent interactions.
+How the codebase implements thinking/reasoning mechanics.
 
-- **Context splitting** — What does each agent "see" vs what's hidden? How is context partitioned between parent and child agents?
-- **Context isolation** — Is there shielding between agents? How do sub-agents avoid polluting the parent context?
-- **Conversation history** — How is history stored, truncated, or summarized? What format? (raw messages, summaries, embeddings)
-- **Shared vs private state** — Is there a shared memory/scratchpad vs per-agent private state? Who can read/write what?
-- **Tool result injection** — How are tool results injected back into context? Verbatim, truncated, summarized, or offloaded to file?
-- **Token budget strategy** — What's the context window budget approach? (token counting, sliding window, compression, tiered recovery)
-- **Long-running flows** — How are long-running flows handled without blowing context limits? (compaction, checkpointing, context reset with summary)
+- **Think step** — Is there a separate "think" step before acting? (chain-of-thought, scratchpad, inner monologue)
+- **Implementation** — Is thinking implemented as a tool, a system prompt instruction, a dedicated node in the graph, or model-native (`extended_thinking`)?
+- **Visibility** — Is the thinking output visible to the user, or internal-only?
+- **Tool selection** — How does reasoning feed into tool selection and argument generation?
+- **Post-execution reflection** — Is there reflection after tool execution? (checking results, deciding next step, self-correction)
+- **Reasoning traces** — Are there explicit reasoning traces stored for debugging or re-use?
 
 ### Key questions
 
 ```
-- Where is the token counting / context limit logic?
-- What happens when context overflows? (error, auto-compact, truncate oldest, summarize)
-- Do sub-agents inherit parent context or start fresh?
-- Is there a "memory" layer separate from conversation history?
+- Is thinking "free" (model-native) or costs an extra LLM call?
+- Does the system strip thinking blocks before returning to the user?
+- Is there a distinction between "planning thinking" and "execution thinking"?
+- Can the agent reason about its own confidence or uncertainty?
 ```
 
 ---
@@ -74,24 +73,25 @@ Analyze the planning mechanics in detail.
 
 ---
 
-## 4. Thinking & Reasoning
+## 4. Context Management
 
-How the codebase implements thinking/reasoning mechanics.
+How the codebase manages context across agent interactions.
 
-- **Think step** — Is there a separate "think" step before acting? (chain-of-thought, scratchpad, inner monologue)
-- **Implementation** — Is thinking implemented as a tool, a system prompt instruction, a dedicated node in the graph, or model-native (`extended_thinking`)?
-- **Visibility** — Is the thinking output visible to the user, or internal-only?
-- **Tool selection** — How does reasoning feed into tool selection and argument generation?
-- **Post-execution reflection** — Is there reflection after tool execution? (checking results, deciding next step, self-correction)
-- **Reasoning traces** — Are there explicit reasoning traces stored for debugging or re-use?
+- **Context splitting** — What does each agent "see" vs what's hidden? How is context partitioned between parent and child agents?
+- **Context isolation** — Is there shielding between agents? How do sub-agents avoid polluting the parent context?
+- **Conversation history** — How is history stored, truncated, or summarized? What format? (raw messages, summaries, embeddings)
+- **Shared vs private state** — Is there a shared memory/scratchpad vs per-agent private state? Who can read/write what?
+- **Tool result injection** — How are tool results injected back into context? Verbatim, truncated, summarized, or offloaded to file?
+- **Token budget strategy** — What's the context window budget approach? (token counting, sliding window, compression, tiered recovery)
+- **Long-running flows** — How are long-running flows handled without blowing context limits? (compaction, checkpointing, context reset with summary)
 
 ### Key questions
 
 ```
-- Is thinking "free" (model-native) or costs an extra LLM call?
-- Does the system strip thinking blocks before returning to the user?
-- Is there a distinction between "planning thinking" and "execution thinking"?
-- Can the agent reason about its own confidence or uncertainty?
+- Where is the token counting / context limit logic?
+- What happens when context overflows? (error, auto-compact, truncate oldest, summarize)
+- Do sub-agents inherit parent context or start fresh?
+- Is there a "memory" layer separate from conversation history?
 ```
 
 ---
@@ -177,9 +177,9 @@ For each of the 7 inspection areas, save a snippet when you find a **non-trivial
 | Inspection area | Typical snippet | Example filename |
 |-----------------|-----------------|------------------|
 | Architecture & Topology | Agent definition schema, factory, registry | `agent_definition.ts` |
-| Context Management | Context compaction, token budgeting, memory layer | `context_compaction.ts` |
-| Planning & Execution | Plan schema, plan-execute loop, re-planning logic | `plan_execute_loop.ts` |
 | Thinking & Reasoning | Think tool, reflection step, reasoning trace | `think_tool.ts` |
+| Planning & Execution | Plan schema, plan-execute loop, re-planning logic | `plan_execute_loop.ts` |
+| Context Management | Context compaction, token budgeting, memory layer | `context_compaction.ts` |
 | Tool System | Tool registry, batch execution, fuzzy matching | `tool_system.ts` |
 | Flow Control | Core agent loop, doom loop detection, retry logic | `session_processor.ts` |
 | State & Persistence | State schema, checkpoint/restore, snapshot revert | `state_checkpoint.ts` |
@@ -243,12 +243,12 @@ Recommended order when analyzing a new codebase:
 
 ```
 1. Architecture & Topology  — get the big picture first
-2. Tool System              — understand what the agents CAN do
-3. Flow Control             — trace one complete execution
-4. State & Persistence      — understand what flows between steps
-5. Context Management       — understand what the LLM sees
-6. Planning & Execution     — understand how complex tasks are decomposed
-7. Thinking & Reasoning     — understand the decision-making mechanics
+2. Thinking & Reasoning     — understand the decision-making mechanics
+3. Planning & Execution     — understand how complex tasks are decomposed
+4. Context Management       — understand what the LLM sees
+5. Tool System              — understand what the agents CAN do
+6. Flow Control             — trace one complete execution
+7. State & Persistence      — understand what flows between steps
 ```
 
 For each section:
