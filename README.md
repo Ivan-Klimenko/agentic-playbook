@@ -45,9 +45,9 @@ Battle-tested agentic patterns for agents receiving untrusted input at scale.
 
 ### [ANTI_PATTERNS.md](./ANTI_PATTERNS.md)
 
-44 common pitfalls when building agents, organized by category with cross-references to fixes.
+42 common pitfalls when building agents, organized by category with cross-references to fixes.
 
-- **Architecture & composition** (15 pitfalls)
+- **Architecture & composition** (13 pitfalls)
 - **Context management** (12 pitfalls)
 - **Tool design** (7 pitfalls)
 - **Prompt engineering** (6 pitfalls)
