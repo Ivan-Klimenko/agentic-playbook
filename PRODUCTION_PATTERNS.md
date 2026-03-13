@@ -410,3 +410,64 @@ permission = merge(
 - **Consistent** — same system for agents, users, and plugins. One evaluation function handles all.
 
 **The "ask" state** creates a real-time approval flow: the tool pauses, publishes an event (displayed as a permission dialog in the UI), and resumes when the user responds with "once" (this call only), "always" (add to approved ruleset), or "reject" (deny all pending for this session).
+
+---
+
+## 15. Memory Hygiene: Scrubbing Ephemeral References
+
+When agents have persistent long-term memory (cross-session facts, user profiles), session-scoped data can leak into it — causing the agent to reference files, uploads, or resources that no longer exist in future sessions.
+
+**The problem:** A user uploads `report.pdf` in session A. The memory system records "User uploaded report.pdf for analysis." In session B, the agent tries to read `/mnt/uploads/report.pdf` — which no longer exists — and wastes turns on error recovery.
+
+**Pattern — regex scrubbing before memory persistence:**
+```python
+# Matches sentences describing file upload *events* (not general file-related work)
+_UPLOAD_SENTENCE_RE = re.compile(
+    r"[^.!?]*\b(?:"
+    r"upload(?:ed|ing)?(?:\s+\w+){0,3}\s+(?:file|document|attachment)"
+    r"|file\s+upload"
+    r"|/mnt/user-data/uploads/"
+    r"|<uploaded_files>"
+    r")[^.!?]*[.!?]?\s*",
+    re.IGNORECASE,
+)
+
+def scrub_before_saving(memory_data: dict) -> dict:
+    # Strip upload sentences from all summary sections
+    for section in ("user", "history"):
+        for field in memory_data.get(section, {}).values():
+            if isinstance(field, dict) and "summary" in field:
+                field["summary"] = _UPLOAD_SENTENCE_RE.sub("", field["summary"]).strip()
+
+    # Remove facts that describe upload events
+    memory_data["facts"] = [
+        f for f in memory_data.get("facts", [])
+        if not _UPLOAD_SENTENCE_RE.search(f.get("content", ""))
+    ]
+    return memory_data
+```
+
+**Also strip from memory update input:** Before sending conversation to the memory-update LLM, strip `<uploaded_files>` tags from human messages. This prevents the LLM from extracting upload events as facts in the first place — defense in depth.
+
+```python
+def format_conversation_for_update(messages):
+    for msg in messages:
+        if msg.role == "human":
+            # Remove ephemeral upload context before memory extraction
+            content = re.sub(r"<uploaded_files>[\s\S]*?</uploaded_files>\n*", "", msg.content)
+            if not content.strip():
+                continue  # skip upload-only messages entirely
+```
+
+**What to scrub (generalized):**
+- File upload references (paths, filenames, upload events)
+- Temporary resource URLs (pre-signed S3 links, sandbox container IDs)
+- Session-specific metadata (thread IDs, run IDs, timestamps of specific interactions)
+- Environment-specific paths that change between deployments
+
+**What NOT to scrub:**
+- "User works with CSV files" — this is a preference, not a session-scoped reference
+- "User prefers PDF export" — behavioral pattern, not ephemeral
+- Technology mentions that happen to involve files — "User uses Docker" is fine
+
+**Why both input-side and output-side scrubbing:** The memory-update LLM is imperfect — it sometimes extracts upload events as facts despite instructions not to. Input-side stripping (removing `<uploaded_files>` tags) prevents most cases. Output-side scrubbing (regex on persisted data) catches what slips through. Neither alone is sufficient.

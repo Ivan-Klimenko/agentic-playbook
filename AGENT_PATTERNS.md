@@ -231,7 +231,7 @@ Not every agent needs a formal plan-and-execute phase. You can delegate planning
 - Tasks where plan visibility matters (user wants to approve the approach)
 - Tasks requiring parallel fan-out to sub-agents (need a plan to know what to fan out)
 
-**The tradeoff:** Without explicit planning, the agent can lose coherence on long runs. Mitigate through TODO anchoring (§3.1), think tool (§3.6), and context recovery (§3.9) — not through plan-and-execute.
+**The tradeoff:** Without explicit planning, the agent can lose coherence on long runs. Mitigate through TODO anchoring (§3.1), think tool (§3.6), and context recovery (§3.10) — not through plan-and-execute.
 
 **Practical implication:** If you start with a no-plan architecture and find the agent drifting on long tasks, add a TODO/plan tool (§3.1) rather than redesigning the entire loop. Planning can be incremental.
 
@@ -299,7 +299,44 @@ for (const strategy of strategies) {
 
 **When to apply this pattern:** Any tool where the LLM must reproduce exact content from memory (find-and-replace, patch application, code insertion at specific locations). Less relevant for tools with structured parameters (API calls, file paths).
 
-### 2.14 Prompt-Driven Plan Execution (No Engine)
+### 2.14 Post-Model Guardrails (Belt-and-Suspenders Enforcement)
+
+Prompt-level instructions ("max 3 task calls per response") are best-effort — the LLM can and will violate them. `recursion_limit` catches infinite loops but not per-turn overcommitment. Add a third enforcement layer: **post-model output processing** that silently corrects violations before tool execution.
+
+**Pattern — `after_model` hook:**
+```python
+class SubagentLimitMiddleware:
+    def __init__(self, max_concurrent: int = 3):
+        self.max_concurrent = clamp(max_concurrent, 2, 4)
+
+    def after_model(self, state):
+        last_msg = state["messages"][-1]
+        tool_calls = last_msg.tool_calls
+
+        # Find task tool calls that exceed the limit
+        task_indices = [i for i, tc in enumerate(tool_calls) if tc["name"] == "task"]
+        if len(task_indices) <= self.max_concurrent:
+            return None  # no correction needed
+
+        # Silently drop excess task calls
+        indices_to_drop = set(task_indices[self.max_concurrent:])
+        truncated = [tc for i, tc in enumerate(tool_calls) if i not in indices_to_drop]
+        return {"messages": [last_msg.copy(update={"tool_calls": truncated})]}
+```
+
+**Three enforcement layers (use all three):**
+
+| Layer | When | Mechanism | Failure mode |
+|-------|------|-----------|--------------|
+| Prompt instructions | Before generation | "Max N task calls per response" | LLM ignores it (~10-20% of the time) |
+| Post-model guardrail | After generation, before execution | `after_model` hook truncates excess | Silent, deterministic, no token cost |
+| Recursion limit | Across turns | `recursion_limit=100` | Stops infinite loops but not per-turn excess |
+
+**Why silent truncation, not error feedback:** Returning an error ("you called too many tools") wastes a turn — the LLM retries with fewer calls, costing tokens and latency. Silent truncation achieves the same result in zero extra turns. The system prompt warns "excess calls are silently discarded" so the LLM learns to self-limit.
+
+**When to apply:** Any constraint the LLM frequently violates despite clear prompt instructions. Common cases: max parallel tool calls, forbidden tool combinations, output format requirements that can be mechanically verified.
+
+### 2.15 Prompt-Driven Plan Execution (No Engine)
 
 An alternative to formal plan-and-execute architectures: use **prompt injection and convention** to drive plan execution, with no plan parser, step tracker, or execution engine.
 
@@ -658,7 +695,40 @@ Tool returns output (any size)
 
 **Difference from §3.2 (virtual filesystem):** Virtual FS is agent-driven (the agent decides to save). Output truncation is framework-driven (happens automatically at the tool boundary). Both serve context protection, but truncation is a safety net while virtual FS is a strategy.
 
-### 3.9 Auto-Continue After Context Recovery
+### 3.9 Context-Loss Detection & Re-injection
+
+When the agent writes state to a tool call (TODO list, plan, configuration), that state exists in the message history. As the conversation grows, the original tool call scrolls out of the effective attention window — the LLM "forgets" its plan even though the data is technically still in messages.
+
+**Pattern — middleware-based detection:**
+```python
+class TodoMiddleware:
+    def before_model(self, state):
+        todos = state.get("todos")
+        if not todos:
+            return None  # no todos to track
+
+        # Check if the original write_todos call is still in recent context
+        messages = state["messages"]
+        has_recent_write = any(
+            getattr(msg, "name", None) == "write_todos"
+            for msg in messages[-20:]  # check last N messages
+        )
+
+        if has_recent_write:
+            return None  # still visible, no action needed
+
+        # Re-inject reminder as a HumanMessage so the LLM re-reads its plan
+        reminder = format_todos_as_reminder(todos)
+        return {"messages": [HumanMessage(content=reminder)]}
+```
+
+**Why this matters:** TODO anchoring (§3.1) works by having the agent rewrite its plan. But if the agent doesn't know it has a plan (because the original `write_todos` call is 50 messages ago), it won't rewrite it. Detection + re-injection closes this gap.
+
+**When to apply:** Any state that the agent manages via tool calls and needs to remember across long conversations — TODO lists, configuration settings, accumulated context. The pattern generalizes beyond TODOs to any "important state that can scroll away."
+
+**Design choice — reminder, not full re-injection:** Inject a concise reminder ("You have an active TODO list: ...") rather than replaying the full tool call. This uses fewer tokens and gives the agent a nudge rather than a verbose replay.
+
+### 3.10 Auto-Continue After Context Recovery
 
 When context compaction is triggered automatically (not by the user), inject a synthetic continuation message so the agent keeps working without manual intervention.
 
@@ -769,6 +839,7 @@ Instruct parallel execution explicitly: *"When you identify multiple independent
 ### Architecture Deep-Dives
 - [OpenCode Architecture](./solutions_architecture/OPENCODE_ARCHITECTURE.md) — agents-as-config, fuzzy edit matching, permission-as-data, prompt-driven planning, batch tool, snapshot/revert
 - [OpenClaw Architecture](./solutions_architecture/OPENCLAW_ARCHITECTURE.md) — multi-channel agent platform, tool policy pipeline, auth failover, dual-loop, HITL
+- [DeerFlow Inspection](./inspections/deer_flow.md) — middleware chain architecture, subagent executor with background pools, memory system with upload scrubbing, post-model guardrails
 
 ### Tutorials
 - [deep-agents-from-scratch](../deep-agents-from-scratch/) — progressive tutorial: TODO anchoring → virtual filesystem → sub-agents → full research agent

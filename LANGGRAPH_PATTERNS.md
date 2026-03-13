@@ -481,6 +481,85 @@ def fetch_node(state: State) -> dict:
 
 > **Rule of thumb:** Cache at the node level, not the graph level. Use TTL for external API data, LRU for deterministic lookups. Don't cache LLM calls unless you're sure identical inputs should produce identical outputs.
 
+## 18. Middleware Chain (`create_agent` + `AgentMiddleware`)
+
+`create_agent` builds a ReAct agent with an ordered middleware chain. Each middleware gets hooks into the agent lifecycle — before/after model calls and around tool execution. This replaces manual graph wiring for cross-cutting concerns.
+
+```python
+from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware
+
+class MyMiddleware(AgentMiddleware[MyState]):
+    """Middleware hooks run in registration order."""
+
+    def before_model(self, state, runtime):
+        """Modify state before LLM call (inject context, check preconditions)."""
+        return {"messages": [HumanMessage(content="reminder...")]}  # or None
+
+    def after_model(self, state, runtime):
+        """Modify state after LLM response (enforce constraints, post-process)."""
+        return None  # or dict with state updates
+
+    def wrap_tool_call(self, request, handler):
+        """Intercept individual tool calls. Can replace, modify, or skip execution."""
+        if request.tool_call["name"] == "dangerous_tool":
+            return ToolMessage(content="Blocked.", tool_call_id=request.tool_call["id"])
+        return handler(request)  # pass through
+
+    async def awrap_tool_call(self, request, handler):
+        """Async version of wrap_tool_call."""
+        return await handler(request)
+
+# Build agent with ordered middleware chain
+agent = create_agent(
+    model=model,
+    tools=tools,
+    middleware=[
+        ThreadDataMiddleware(),       # 1. setup paths
+        SandboxMiddleware(),          # 2. acquire sandbox
+        ToolErrorHandlingMiddleware(),# 3. catch tool exceptions
+        ClarificationMiddleware(),   # 4. MUST BE LAST — can interrupt
+    ],
+    system_prompt="...",
+    state_schema=MyState,
+)
+```
+
+### Tool Interception for Flow Control
+
+`wrap_tool_call` enables middleware-based flow control — intercepting specific tools to change execution behavior without modifying the tool itself:
+
+```python
+class ClarificationMiddleware(AgentMiddleware):
+    """Intercepts ask_clarification tool → interrupts execution for user input."""
+
+    def wrap_tool_call(self, request, handler):
+        if request.tool_call.get("name") != "ask_clarification":
+            return handler(request)  # pass through all other tools
+
+        # Format the question for the user
+        args = request.tool_call.get("args", {})
+        formatted = format_question(args["question"], args.get("options", []))
+
+        # Interrupt execution — state is checkpointed, user responds later
+        return Command(
+            update={"messages": [ToolMessage(content=formatted, tool_call_id=request.tool_call["id"])]},
+            goto=END,  # stops the agent loop
+        )
+```
+
+**Key patterns:**
+- **Error wrapping**: Catch exceptions in `wrap_tool_call`, return `ToolMessage(status="error")` — agent loop continues instead of crashing. Preserve `GraphBubbleUp` exceptions (LangGraph control flow signals).
+- **Post-model enforcement**: Use `after_model` to truncate excess tool calls, enforce constraints the prompt can't guarantee (see AGENT_PATTERNS.md §2.14).
+- **Context injection**: Use `before_model` to inject reminders, upload metadata, or image data into messages before the LLM sees them.
+
+**Ordering matters:**
+- Middleware that sets up state (paths, sandbox) should come first
+- Error handling should come before flow-control middleware
+- Middleware that can interrupt execution (`Command(goto=END)`) **must be last** — otherwise downstream middleware never runs
+
+> **When to use `create_agent` vs `StateGraph`:** Use `create_agent` when you want a standard ReAct loop with cross-cutting concerns (error handling, context injection, tool interception). Use `StateGraph` when you need custom graph topology, non-ReAct patterns, or explicit node-level control.
+
 ---
 
 ## References
