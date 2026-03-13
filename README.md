@@ -16,16 +16,13 @@ Core agentic design patterns — framework-agnostic, applicable to any agent sys
 
 ### [LANGGRAPH_PATTERNS.md](./LANGGRAPH_PATTERNS.md)
 
-LangGraph-specific implementation patterns and code snippets.
+LangGraph-specific implementation patterns and code snippets, organized from architecture to infrastructure.
 
-- **State & reducers** — output schemas, reducer types
-- **ReAct loop wiring** — agent ↔ tools ↔ conditional edges
-- **Command** — cross-graph state updates, routing with goto
-- **Injection** — InjectedState, InjectedToolCallId, InjectedToolArg
-- **Structured output** — Pydantic schemas with error handling
-- **Map-Reduce** — Send API for parallel fan-out
-- **Human-in-the-loop** — interrupt() + checkpointer resume
-- **Sub-agents** — sub-graph as tool, registry factory, streaming
+- **Architecture & design** — pattern taxonomy (6 archetypes), state design principles, node granularity guidance
+- **Graph construction & routing** — ReAct loop wiring, Command (cross-graph updates + goto routing), Map-Reduce with Send API, functional API (`@entrypoint`/`@task`)
+- **Tools & structured output** — InjectedState/InjectedToolCallId/InjectedToolArg, Pydantic schemas with error handling
+- **Multi-agent patterns** — sub-graph as tool, sub-agent registry factory
+- **Infrastructure & operations** — human-in-the-loop (interrupt placement gotchas), checkpointing & persistence (durability modes), streaming with subgraph visibility, error handling strategies (RetryPolicy + LLM-recoverable loop), caching in nodes
 
 ### [PRODUCTION_PATTERNS.md](./PRODUCTION_PATTERNS.md)
 
@@ -48,9 +45,9 @@ Battle-tested agentic patterns for agents receiving untrusted input at scale.
 
 ### [ANTI_PATTERNS.md](./ANTI_PATTERNS.md)
 
-40 common pitfalls when building agents, organized by category with cross-references to fixes.
+44 common pitfalls when building agents, organized by category with cross-references to fixes.
 
-- **Architecture & composition** (11 pitfalls)
+- **Architecture & composition** (15 pitfalls)
 - **Context management** (12 pitfalls)
 - **Tool design** (7 pitfalls)
 - **Prompt engineering** (6 pitfalls)
