@@ -143,7 +143,34 @@ How the codebase manages long-running and complex flows.
 
 ---
 
-## 7. State & Persistence
+## 7. User Interruption & Interference
+
+How the codebase handles user interrupting, cancelling, or redirecting agent work mid-execution.
+
+- **Interrupt primitive** — Is there a built-in interrupt mechanism? (e.g., LangGraph `interrupt()`, AbortSignal, custom cancellation token) How is it surfaced — tool-level gate, global signal, or event?
+- **Permission-as-data** — Are tool calls gated by per-tool approval? Look for three-state patterns: `allow` / `deny` / `ask`. Does the agent pause and wait for user decision before executing dangerous operations?
+- **Cancellation propagation** — How does a cancel signal propagate through sub-agents? Is `AbortSignal` (or equivalent) passed to child sessions? Are in-flight tool calls cleaned up? (e.g., marking incomplete tools as `{ status: "error", error: "aborted" }`)
+- **Checkpointing for resume** — Is state checkpointed before interrupt points so execution can resume? What checkpointer is used? (in-memory, SQLite, Postgres) What durability mode? (`background`, `sync`, `exit`)
+- **Message steering** — Can new user messages be injected mid-run without restarting? (pending message queue, injection at next tool boundary) Or does a new message kill the current run?
+- **Dangling tool call recovery** — What happens to tool calls that were in-flight when interruption occurred? Is there middleware to patch missing ToolMessages from interrupted calls?
+- **Clarification-as-interrupt** — Is there an `ask_clarification` or `ask_user` tool that pauses execution and waits for user input? Does it use `Command(goto=END)` or similar to halt the graph?
+- **Auto-continue after interrupt** — After the user responds to an interruption, how does execution resume? Is a synthetic message injected (e.g., "Continue if you have next steps")? Or does the user manually trigger continuation?
+
+### Key questions
+
+```
+- What is the interrupt granularity? (whole-run, per-tool, per-step)
+- Is there a general-purpose pause/resume API, or only tool-specific gates (e.g., clarification only)?
+- How does the system distinguish between "user wants to cancel" vs "user wants to redirect"?
+- Are side effects idempotent across interrupt/resume? (if interrupt() is placed AFTER a side effect, resuming re-executes it)
+- What prevents the agent from acting on stale pre-interrupt context after resume?
+- Does the UI show the agent's pending action before requesting approval?
+- How are sub-agent trees torn down on cancellation? Is it graceful or immediate?
+```
+
+---
+
+## 8. State & Persistence
 
 How state is managed throughout the agent's lifecycle.
 
@@ -166,13 +193,13 @@ How state is managed throughout the agent's lifecycle.
 
 ---
 
-## 8. Saving Code Snippets
+## 9. Saving Code Snippets
 
 As you inspect each section, extract key implementation patterns into `code_snippets/<project_name>/`.
 
 ### What to save
 
-For each of the 7 inspection areas, save a snippet when you find a **non-trivial, reusable pattern**:
+For each of the 8 inspection areas, save a snippet when you find a **non-trivial, reusable pattern**:
 
 | Inspection area | Typical snippet | Example filename |
 |-----------------|-----------------|------------------|
@@ -182,6 +209,7 @@ For each of the 7 inspection areas, save a snippet when you find a **non-trivial
 | Context Management | Context compaction, token budgeting, memory layer | `context_compaction.ts` |
 | Tool System | Tool registry, batch execution, fuzzy matching | `tool_system.ts` |
 | Flow Control | Core agent loop, doom loop detection, retry logic | `session_processor.ts` |
+| User Interruption | Interrupt primitive, permission gate, cancel propagation | `interrupt_handling.ts` |
 | State & Persistence | State schema, checkpoint/restore, snapshot revert | `state_checkpoint.ts` |
 
 Also save cross-cutting patterns that don't fit one section:
@@ -242,13 +270,14 @@ code_snippets/
 Recommended order when analyzing a new codebase:
 
 ```
-1. Architecture & Topology  — get the big picture first
-2. Thinking & Reasoning     — understand the decision-making mechanics
-3. Planning & Execution     — understand how complex tasks are decomposed
-4. Context Management       — understand what the LLM sees
-5. Tool System              — understand what the agents CAN do
-6. Flow Control             — trace one complete execution
-7. State & Persistence      — understand what flows between steps
+1. Architecture & Topology      — get the big picture first
+2. Thinking & Reasoning         — understand the decision-making mechanics
+3. Planning & Execution         — understand how complex tasks are decomposed
+4. Context Management           — understand what the LLM sees
+5. Tool System                  — understand what the agents CAN do
+6. Flow Control                 — trace one complete execution
+7. User Interruption            — understand how users can intervene mid-run
+8. State & Persistence          — understand what flows between steps
 ```
 
 For each section:
