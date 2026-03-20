@@ -264,6 +264,72 @@ ChannelPlugin = {
 
 ---
 
+## 11. Crash Storm Detection with Graceful Degradation
+
+When agent workers run as separate processes (multiprocessing, containers, pods), crashes are inevitable. The key is distinguishing normal failures from cascading crash storms, and degrading gracefully instead of restart-looping.
+
+**Pattern — crash counting with time window:**
+
+```python
+CRASH_TS: List[float] = []     # Timestamps of recent crashes
+SPAWN_GRACE_SEC = 90.0         # Don't count crashes right after spawn (init takes time)
+CRASH_STORM_THRESHOLD = 3      # Crashes in window
+CRASH_WINDOW_SEC = 60.0        # Time window
+
+def ensure_workers_healthy():
+    # Grace period: workers need time to initialize (pip, Drive FUSE, model loading)
+    if (time.time() - last_spawn_time) < SPAWN_GRACE_SEC:
+        return
+
+    now = time.time()
+    busy_crashes = 0
+    for wid, w in list(WORKERS.items()):
+        if not w.proc.is_alive():
+            if w.busy_task_id is not None:
+                busy_crashes += 1
+                # Re-queue the task to front of pending
+                requeue_task(w.busy_task_id, front=True)
+            respawn_worker(wid)
+
+    # Only count MEANINGFUL failures — not idle worker deaths
+    alive = sum(1 for w in WORKERS.values() if w.proc.is_alive())
+    if busy_crashes > 0 or alive == 0:
+        CRASH_TS.extend([now] * max(1, busy_crashes))
+    else:
+        CRASH_TS.clear()  # Idle deaths with healthy workers = not a storm
+
+    # Expire old timestamps
+    CRASH_TS[:] = [t for t in CRASH_TS if (now - t) < CRASH_WINDOW_SEC]
+
+    if len(CRASH_TS) >= CRASH_STORM_THRESHOLD:
+        handle_crash_storm()
+```
+
+**Graceful degradation — don't restart, downgrade:**
+
+```python
+def handle_crash_storm():
+    """DON'T os.execv restart — that creates infinite loops.
+    Instead: kill workers, switch to single-threaded mode."""
+    notify_owner("⚠️ Crash storm detected. Switching to direct-chat mode.")
+    kill_workers()          # Clean up all multiprocessing workers
+    CRASH_TS.clear()        # Reset counter
+    # Agent continues working in the main thread via handle_chat_direct()
+    # (threading instead of multiprocessing — less throughput, but stable)
+```
+
+**Why this matters:**
+- **execv restart on crash** is the most common mistake — if the crash is caused by the code itself (e.g. self-modification gone wrong), restarting loads the same broken code, creating an infinite loop
+- **Idle worker deaths** should not trigger crash storm — on resource-constrained environments (Colab), idle workers may be killed by the OS. Only count failures that affect active tasks.
+- **Spawn grace period** prevents false positives — workers may take 60-90s to initialize (especially on Colab with Drive FUSE mount). Counting initialization failures as crashes triggers false storm detection.
+- **Task re-queuing** ensures work isn't lost — the task that was being processed by the crashed worker goes back to the front of the queue for the next healthy worker.
+
+**Combine with:** Stable branch fallback ([PRODUCTION_PATTERNS §17](./PRODUCTION_PATTERNS.md#17-self-modification-lifecycle-safety)) for agents that modify their own code — on crash storm, checkout the last known-good branch before restarting.
+
+> See: [code_snippets/ouroboros/supervisor_lifecycle.py](./code_snippets/ouroboros/supervisor_lifecycle.py) | Source: [Ouroboros](./inspections/ouroboros.md)
+
+---
+
 ## 5. Anti-Patterns & Pitfalls
 
 | Anti-pattern | Why it's bad | Fix |
@@ -276,6 +342,7 @@ ChannelPlugin = {
 | Async hooks on hot paths | Message serialization stalls on slow plugins | Enforce sync-only hooks where latency matters (see §6) |
 | Pure vector OR pure keyword search | Misses exact names or semantic paraphrases | Hybrid search with weighted merge (see §7) |
 | Whitelisting binaries without flag restrictions | `grep -r /etc/passwd` reads any file | Per-command flag profiles (see §8) |
+| Restarting on crash storm | Self-modifying agents restart into broken code → infinite loop | Degrade to single-threaded mode + stable branch fallback (see §11) |
 
 > For agentic-level anti-patterns (state management, prompts, graph design), see [AGENT_PATTERNS.md](./AGENT_PATTERNS.md#5-anti-patterns--pitfalls).
 
@@ -286,3 +353,4 @@ ChannelPlugin = {
 ### Architecture Case Studies
 - [openclaw.md](./inspections/openclaw.md) — deep-dive into OpenClaw's agentic architecture (gateway, tool policies, sub-agents, memory, security)
 - [code_snippets/](./code_snippets/openclaw/) — TypeScript implementations of production patterns from OpenClaw
+- [ouroboros.md](./inspections/ouroboros.md) — self-modifying agent with crash storm detection, worker pool management, file-based persistence on cloud storage

@@ -471,3 +471,154 @@ def format_conversation_for_update(messages):
 - Technology mentions that happen to involve files — "User uses Docker" is fine
 
 **Why both input-side and output-side scrubbing:** The memory-update LLM is imperfect — it sometimes extracts upload events as facts despite instructions not to. Input-side stripping (removing `<uploaded_files>` tags) prevents most cases. Output-side scrubbing (regex on persisted data) catches what slips through. Neither alone is sufficient.
+
+---
+
+## 16. Budget-Aware Execution Guards
+
+Autonomous agents that run without human supervision need multi-layer budget protection. Simple "stop at $X" isn't enough — budget tracking can drift from reality, and hard stops without a final response leave work dangling.
+
+**Layer 1 — Per-task budget guards (in the agent loop):**
+
+```python
+task_cost = accumulated_usage.get("cost", 0)
+budget_pct = task_cost / budget_remaining if budget_remaining > 0 else 1.0
+
+if budget_pct > 0.5:
+    # Hard stop: inject budget limit message, get one final response with tools disabled
+    messages.append({"role": "system", "content":
+        f"[BUDGET LIMIT] Spent ${task_cost:.3f} (>50% of remaining ${budget_remaining:.2f}). "
+        f"Give your final response now."})
+    return call_llm(messages, tools=None)  # No tools = force text response
+
+elif budget_pct > 0.3 and round_idx % 10 == 0:
+    # Soft nudge: informational, agent decides
+    messages.append({"role": "system", "content":
+        f"[INFO] Spent ${task_cost:.3f} of ${budget_remaining:.2f}. Wrap up if possible."})
+```
+
+**Layer 2 — Budget drift detection (ground truth reconciliation):**
+
+Local cost tracking accumulates rounding errors and misses failed-but-billed requests. Periodically compare tracked spending against the provider's ground truth:
+
+```python
+# Every 50 LLM calls, check actual spend via provider API
+if spent_calls % 50 == 0:
+    ground_truth = fetch_provider_usage()  # e.g. OpenRouter /api/v1/auth/key
+    if ground_truth:
+        # Compare deltas since session start (not absolute values)
+        or_delta = ground_truth["total_usd"] - session_start_snapshot
+        our_delta = tracked_spent - session_start_spent
+
+        drift_pct = abs(or_delta - our_delta) / max(abs(or_delta), 0.01) * 100
+        # Alert only on significant drift (both relative AND absolute)
+        if drift_pct > 50 and abs(or_delta - our_delta) > 5.0:
+            state["budget_drift_alert"] = True
+```
+
+**Layer 3 — Category budget isolation:**
+
+Different task types get separate budget allocations:
+
+```
+Total budget: $500
+├── Regular tasks: unlimited (within total)
+├── Background consciousness: 10% ($50 max)
+├── Evolution/self-improvement: stops at $50 remaining (reserve for conversations)
+└── Each task: hard-capped at 50% of remaining budget
+```
+
+**Layer 4 — Evolution circuit breaker:**
+
+Continuous improvement loops can burn budget on broken cycles. Track consecutive failures and auto-disable:
+
+```python
+if task_type == "evolution":
+    if cost > 0.10 and rounds >= 1:
+        state["evolution_consecutive_failures"] = 0  # Success: reset
+    else:
+        failures = state["evolution_consecutive_failures"] + 1
+        if failures >= 3:
+            state["evolution_mode_enabled"] = False  # Auto-disable
+            notify_owner("Evolution paused: 3 consecutive failures")
+```
+
+**Design principles:**
+- **Soft before hard**: nudge at 30%, force at 50%. Gives the agent a chance to wrap up gracefully.
+- **Relative thresholds, not absolute**: "50% of remaining" scales naturally as budget depletes.
+- **Session-relative drift**: compare deltas since session start, not absolute totals. This handles shared API keys and pre-existing spend.
+- **Alert on both relative AND absolute**: 50% drift on $0.10 is noise; 50% drift on $10 is real.
+
+> See: [code_snippets/ouroboros/budget_tracking.py](./code_snippets/ouroboros/budget_tracking.py) | Source: [Ouroboros](./inspections/ouroboros.md)
+
+---
+
+## 17. Self-Modification Lifecycle Safety
+
+When agents can modify their own code and restart, the deployment pipeline needs safety rails that don't exist in conventional software:
+
+**The restart flow:**
+
+```
+1. Agent reads own code (repo_read)
+2. Agent writes modified code (repo_write_commit → auto-commits to dev branch)
+3. Agent pushes (repo_commit_push → push to remote)
+4. Agent calls request_restart → supervisor handles:
+   a. Save pre-restart state (tg_offset, session_id, queue snapshot)
+   b. Record expected SHA for post-restart verification
+   c. os.execv(sys.executable, [sys.executable, launcher])  ← full process replace
+5. Post-restart:
+   a. SHA verification: compare booted code SHA against expected
+   b. Auto-resume: inject synthetic message to continue from scratchpad
+6. On success: promote dev → stable branch
+7. On crash: supervisor falls back to stable branch
+```
+
+**Critical safety patterns:**
+
+**Pre-restart state preservation:**
+```python
+# Save everything needed to resume: Telegram offset (dedup), session ID, queue
+verify_path = drive_path("state/pending_restart_verify.json")
+write_json(verify_path, {
+    "expected_sha": current_git_sha,
+    "expected_branch": current_branch,
+    "reason": restart_reason,
+})
+persist_queue_snapshot()  # Save pending + running tasks for replay
+```
+
+**Post-restart SHA verification:**
+```python
+# Worker boot event includes git SHA — compare against expectation
+if observed_sha != expected_sha:
+    notify_owner(f"⚠️ Worker SHA mismatch: expected {expected_sha[:8]}, got {observed_sha[:8]}")
+```
+
+**Auto-rescue of uncommitted changes:**
+```python
+# On startup: if there are dirty files, commit + push before doing anything else
+dirty_files = git_status_porcelain()
+if dirty_files:
+    git_add("-u")  # Only tracked files, not secrets
+    git_commit("auto-rescue: uncommitted changes detected on startup")
+    git_pull("--rebase")
+    git_push()  # If push fails, undo the commit (git reset HEAD~1)
+```
+
+**Stable branch fallback:**
+```
+main        ← creator's branch (read-only for agent)
+dev         ← agent's working branch (all commits here)
+dev-stable  ← promoted when agent considers code stable
+```
+On crash storm (3+ crashes in 60s): supervisor checks out `dev-stable` and restarts. This prevents a broken self-modification from permanently bricking the agent.
+
+**Evolution mode gating:** Block restarts during evolution tasks unless the agent has successfully pushed code first. This prevents restarting into a half-written state:
+```python
+def request_restart(ctx, reason):
+    if ctx.current_task_type == "evolution" and not ctx.last_push_succeeded:
+        return "⚠️ RESTART_BLOCKED: commit+push first."
+```
+
+> Source: [Ouroboros](./inspections/ouroboros.md) — `agent.py`, `events.py:_handle_restart_request`
