@@ -98,6 +98,7 @@ Project-level architecture deep-dives and codebase inspections (following [PROJE
 - [opencode.md](./inspections/opencode.md) — open-source AI coding agent (~100K-LOC TypeScript)
 - [deer_flow.md](./inspections/deer_flow.md) — super agent harness with middleware chain, subagent executor, LLM-powered memory (Python, LangGraph)
 - [ouroboros.md](./inspections/ouroboros.md) — self-modifying autonomous agent with background consciousness, multi-worker supervisor, constitutional governance (Python, OpenRouter)
+- [claude_code.md](./inspections/claude_code.md) — Anthropic's agentic CLI with markdown-as-code plugin system, event-driven hooks, multi-agent review pipelines, hierarchical permissions (TypeScript core + Python/Markdown plugins)
 
 ### [code_snippets/](./code_snippets/)
 
@@ -139,6 +140,14 @@ code_snippets/ouroboros/         (Python)
   consciousness_loop.py     — background daemon, budget isolation, LLM-controlled wakeup
   owner_injection.py        — per-task mailbox, mid-run message steering via Drive
   budget_tracking.py        — cost estimation, atomic state, drift detection, category breakdown
+
+code_snippets/claude_code/       (Python/Markdown)
+  hook_rule_engine.py       — declarative rule engine with hot-reload, fail-safe hooks, cached regex
+  pretool_hook.py           — PreToolUse hook pattern with exit code protocol (0/1/2)
+  plugin_system.md          — plugin manifest, command/agent/skill/hook schemas, composition patterns
+  permission_model.json     — three-tier settings hierarchy, allow/ask/deny, sandbox isolation
+  multi_agent_review.md     — parallel review agents + per-issue validation + confidence filtering
+  stop_hook_quality_gate.md — Stop hooks as quality enforcement (test/build/completion gates)
 ```
 
 ## Sources
@@ -149,6 +158,7 @@ Patterns are drawn from:
 - Architecture analysis of [OpenCode](./inspections/opencode.md) (open-source AI coding agent)
 - Architecture analysis of [DeerFlow](./inspections/deer_flow.md) (super agent harness, LangGraph middleware chain)
 - Architecture analysis of [Ouroboros](./inspections/ouroboros.md) (self-modifying autonomous agent with background consciousness)
+- Architecture analysis of [Claude Code](./inspections/claude_code.md) (Anthropic's agentic CLI with plugin ecosystem)
 - [deep-agents-from-scratch](https://github.com/) tutorials (TODO anchoring, virtual FS, context offloading, sub-agents)
 - [Anthropic: Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents)
 - [LangGraph](https://github.com/langchain-ai/langgraph) docs and patterns

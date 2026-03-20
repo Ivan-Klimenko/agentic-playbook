@@ -622,3 +622,61 @@ def request_restart(ctx, reason):
 ```
 
 > Source: [Ouroboros](./inspections/ouroboros.md) — `agent.py`, `events.py:_handle_restart_request`
+
+## 18. Multi-Agent Review with Confidence Filtering
+
+When using agents for validation tasks (code review, security audit, compliance checks), a single agent produces too many false positives. Use a **multi-stage pipeline** with parallel reviewers, per-finding validation, and confidence thresholds:
+
+```
+Stage 1: Guard check (cheap model)
+  └── Skip if not applicable (draft PR, already reviewed, trivial change)
+
+Stage 2: Context gathering (cheap model)
+  └── Collect project rules, style guides, CLAUDE.md files
+
+Stage 3: Parallel review (mixed models)
+  ├── Agent A: Rule compliance (cheaper model) ─┐
+  ├── Agent B: Rule compliance (cheaper model) ─┤ Redundancy for recall
+  ├── Agent C: Bug detection (stronger model)  ─┤
+  └── Agent D: Logic/security (stronger model) ─┘
+
+Stage 4: Per-finding validation
+  └── For each finding: launch validator → confirm it's real → score 0-100
+
+Stage 5: Confidence filter
+  └── Only findings ≥ threshold (e.g., 80) survive
+```
+
+**Key design decisions:**
+
+**Use redundant agents for recall:** Two agents with the same focus (e.g., compliance) catch more issues than one. Findings are deduplicated after validation.
+
+**Match model strength to task difficulty:** Use cheap/fast models (Haiku) for guard checks and context gathering. Use stronger models (Opus) for bug detection where reasoning matters. Use mid-tier (Sonnet) for rule compliance where pattern matching suffices.
+
+**Define explicit false-positive categories** in the agent prompts:
+```
+DO NOT FLAG:
+- Pre-existing issues (not introduced in this change)
+- Issues a linter will catch (handled by CI)
+- Pedantic nitpicks a senior engineer would skip
+- Issues with explicit lint-ignore comments
+- Code style concerns (unless in project rules)
+```
+
+**Confidence scoring** — agents rate each finding:
+```
+0-25:  Likely false positive or pre-existing
+26-50: Minor nitpick
+51-75: Valid but low-impact
+76-90: Important, requires attention
+91-100: Critical (syntax error, explicit rule violation)
+```
+
+**The validation stage is crucial.** Without it, you get 10x more findings, most wrong. Each finding gets its own validation agent that reads the actual code and confirms the issue exists. This is more expensive but dramatically improves signal-to-noise.
+
+**Pattern variations:**
+- **Feature dev review**: 3 parallel reviewers (simplicity, bugs, conventions) → present to user for triage
+- **PR review toolkit**: 6 specialized agents (comments, tests, errors, types, code, simplify) → severity-categorized report
+- **Dedup pipeline**: 5 parallel search agents → filter agent removes false positives
+
+> Source: [Claude Code](./inspections/claude_code.md) §3, `code_snippets/claude_code/multi_agent_review.md`

@@ -371,6 +371,79 @@ Execution phase:
 
 **When you need a structured engine:** When plans must execute in exact order. When step failures need programmatic fallbacks. When plan compliance must be verified mechanically (audit requirements).
 
+### 2.16 Markdown-as-Code Plugin Primitives
+
+Define agents, commands, skills, and hooks entirely in **markdown files** with YAML frontmatter. No code needed — the runtime interprets markdown as executable configuration. Four orthogonal primitives compose into rich workflows:
+
+| Primitive | Trigger | What it is |
+|-----------|---------|------------|
+| **Command** | User invokes `/slash` | Structured workflow with phases, HITL gates, agent launches |
+| **Agent** | LLM detects trigger condition | Autonomous sub-agent with own model, tools, color |
+| **Skill** | LLM detects domain relevance | Progressive-disclosure knowledge package (metadata → body → resources) |
+| **Hook** | System event fires | Script or LLM-evaluated interception of tool calls, stop signals, etc. |
+
+```markdown
+# Agent definition — the entire file IS the agent
+---
+name: code-reviewer
+description: Use this agent when code was just written or modified...
+tools: [Read, Grep, Glob]
+model: opus
+color: green
+maxTurns: 20
+---
+You are an expert code reviewer. Rate each issue 0-100...
+Only report issues with confidence ≥ 80.
+```
+
+**Key design properties:**
+- **Non-developers can create agents** — no code, just markdown with YAML frontmatter
+- **Convention-based discovery** — files in `commands/`, `agents/`, `skills/` dirs are auto-discovered
+- **Progressive skill loading** — metadata (~100 words) always in context; full SKILL.md (<5k words) loaded on trigger; `references/` and `scripts/` loaded on demand. Keeps token budget efficient.
+- **Commands orchestrate agents** — a command's markdown body defines a multi-phase workflow that launches agents at specific phases
+
+**When to use:** CLI tools, IDE extensions, or any system where extensibility matters more than execution speed. The markdown format is LLM-native — the AI can read, write, and debug plugins naturally.
+
+> See: [Claude Code inspection](./inspections/claude_code.md) §1, `code_snippets/claude_code/plugin_system.md`
+
+### 2.17 Event-Driven Hook Interception
+
+Intercept the agent loop at well-defined lifecycle events without modifying the core runtime. Hooks are registered declaratively (JSON) and execute as either **command hooks** (external scripts) or **prompt hooks** (LLM-evaluated).
+
+```
+Agent Loop:  plan → [PreToolUse] → execute tool → [PostToolUse] → observe → ... → [Stop]
+                       │                                │                            │
+                   Hook fires:                    Hook fires:                   Hook fires:
+                   validate/block                 lint/format                   check tests ran
+```
+
+**Hook events:** PreToolUse, PostToolUse, Stop, SubagentStop, SessionStart, SessionEnd, UserPromptSubmit, PreCompact, PostCompact, StopFailure, Notification
+
+**Hook I/O protocol (command hooks):**
+```
+stdin: JSON { tool_name, tool_input, hook_event_name, transcript_path }
+stdout: JSON { permissionDecision: "allow|deny|ask", systemMessage: "...", updatedInput: {...} }
+exit: 0=allow, 1=show stderr to user, 2=block+show to Claude
+```
+
+**Prompt hooks** — the LLM itself decides:
+```json
+{
+  "type": "prompt",
+  "prompt": "If command contains 'rm -rf', return 'deny'. Otherwise 'approve'."
+}
+```
+
+**Key patterns:**
+- **Stop hooks as quality gates**: Block stopping until tests run, build passes, or docs updated. The agent literally cannot finish without meeting criteria.
+- **PreToolUse validation**: Block dangerous commands, validate file paths, enforce style before writes.
+- **Fail-safe design**: All hooks MUST exit 0 on error — never block operations due to hook failures.
+- **Hot-reloadable rules**: Load rule files from disk on every invocation, no restart needed.
+
+**The Stop hook is particularly powerful** — it converts "quality suggestions" into "hard enforcement". The agent can decide it's done, but the Stop hook says "no, run the tests first."
+
+> See: [Claude Code inspection](./inspections/claude_code.md) §6, `code_snippets/claude_code/stop_hook_quality_gate.md`
+
 ---
 
 ## 3. Context Engineering
