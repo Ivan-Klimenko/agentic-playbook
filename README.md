@@ -97,6 +97,7 @@ Project-level architecture deep-dives and codebase inspections (following [PROJE
 - [openclaw.md](./inspections/openclaw.md) — production agent orchestration platform (628K-LOC TypeScript, 50+ messaging channels)
 - [opencode.md](./inspections/opencode.md) — open-source AI coding agent (~100K-LOC TypeScript)
 - [deer_flow.md](./inspections/deer_flow.md) — super agent harness with middleware chain, subagent executor, LLM-powered memory (Python, LangGraph)
+- [ouroboros.md](./inspections/ouroboros.md) — self-modifying autonomous agent with background consciousness, multi-worker supervisor, constitutional governance (Python, OpenRouter)
 
 ### [code_snippets/](./code_snippets/)
 
@@ -129,6 +130,15 @@ code_snippets/deer_flow/         (Python)
   memory_system.py           — LLM-powered persistent memory, confidence-scored facts, token budgeting
   tool_system.py             — multi-source tool composition (config + built-in + MCP), caching
   prompt_engineering.py      — dynamic prompt assembly, CLARIFY→PLAN→ACT, progressive skill loading
+
+code_snippets/ouroboros/         (Python)
+  llm_tool_loop.py          — core ReAct loop with budget guards, self-check, model fallback
+  context_assembly.py       — 3-block prompt caching, soft-cap trimming, two-tier compaction
+  tool_registry.py          — plugin auto-discovery, two-tier visibility, thread-sticky executor
+  supervisor_lifecycle.py   — worker pool, crash storm detection, timeouts, event dispatch
+  consciousness_loop.py     — background daemon, budget isolation, LLM-controlled wakeup
+  owner_injection.py        — per-task mailbox, mid-run message steering via Drive
+  budget_tracking.py        — cost estimation, atomic state, drift detection, category breakdown
 ```
 
 ## Sources
@@ -138,6 +148,7 @@ Patterns are drawn from:
 - Production work on [OpenClaw](./inspections/openclaw.md) (multi-channel agent platform)
 - Architecture analysis of [OpenCode](./inspections/opencode.md) (open-source AI coding agent)
 - Architecture analysis of [DeerFlow](./inspections/deer_flow.md) (super agent harness, LangGraph middleware chain)
+- Architecture analysis of [Ouroboros](./inspections/ouroboros.md) (self-modifying autonomous agent with background consciousness)
 - [deep-agents-from-scratch](https://github.com/) tutorials (TODO anchoring, virtual FS, context offloading, sub-agents)
 - [Anthropic: Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents)
 - [LangGraph](https://github.com/langchain-ai/langgraph) docs and patterns
