@@ -6,7 +6,7 @@ It resolves model, tools, middlewares, and system prompt from runtime config,
 agent-specific config files, and global defaults. This pattern enables
 a single agent codebase to serve as multiple "personalities" via config.
 
-Source: backend/src/agents/lead_agent/agent.py
+Source: backend/packages/harness/deerflow/agents/lead_agent/agent.py
 """
 
 # --- State Schema ---
@@ -37,7 +37,7 @@ def merge_artifacts(existing, new) -> list[str]:
 def make_lead_agent(config: RunnableConfig):
     cfg = config.get("configurable", {})
 
-    # 1. Resolve model (request → agent config → global default)
+    # 1. Resolve model (request -> agent config -> global default)
     model_name = cfg.get("model_name") or agent_config.model or default_model
     model = create_chat_model(
         name=model_name,
@@ -52,7 +52,7 @@ def make_lead_agent(config: RunnableConfig):
         subagent_enabled=cfg.get("subagent_enabled", False),
     )
 
-    # 3. Build ordered middleware chain
+    # 3. Build ordered middleware chain (13 middlewares)
     middlewares = _build_middlewares(config, model_name, agent_name)
 
     # 4. Generate system prompt (memory + skills + subagent guide)
@@ -76,13 +76,12 @@ def make_lead_agent(config: RunnableConfig):
 # before_model(), after_model(), wrap_tool_call(), before_agent(), after_agent()
 
 def _build_middlewares(config, model_name, agent_name=None):
-    # Base runtime middlewares (shared with subagents)
     middlewares = [
-        ThreadDataMiddleware(),   # sets workspace/uploads/outputs paths
-        UploadsMiddleware(),      # injects uploaded file list into messages
-        SandboxMiddleware(),      # acquires sandbox environment
-        DanglingToolCallMiddleware(),  # patches missing ToolMessages
-        ToolErrorHandlingMiddleware(), # converts exceptions → error ToolMessages
+        ThreadDataMiddleware(),        # 1. sets workspace/uploads/outputs paths
+        UploadsMiddleware(),           # 2. injects uploaded file list into messages
+        SandboxMiddleware(),           # 3. acquires sandbox environment
+        DanglingToolCallMiddleware(),  # 4. patches missing ToolMessages
+        ToolErrorHandlingMiddleware(), # 5. converts exceptions -> error ToolMessages
     ]
 
     # Optional middlewares based on runtime config
@@ -98,9 +97,15 @@ def _build_middlewares(config, model_name, agent_name=None):
     if model_supports_vision:
         middlewares.append(ViewImageMiddleware())
 
+    if tool_search_enabled:
+        middlewares.append(DeferredToolFilterMiddleware())  # hides deferred MCP tool schemas
+
     if subagent_enabled:
         middlewares.append(SubagentLimitMiddleware(max_concurrent=3))
 
-    # ClarificationMiddleware MUST be last — it can interrupt execution
+    # Loop detection: breaks repetitive tool call patterns
+    middlewares.append(LoopDetectionMiddleware(warn_threshold=3, hard_limit=5, window_size=20))
+
+    # ClarificationMiddleware MUST be last -- it can interrupt execution
     middlewares.append(ClarificationMiddleware())
     return middlewares

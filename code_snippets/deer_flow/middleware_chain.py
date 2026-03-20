@@ -1,15 +1,16 @@
 """
 DeerFlow Middleware Chain Patterns
 
-Three critical middleware patterns that control agent flow:
-1. ToolErrorHandlingMiddleware — converts exceptions to ToolMessages (agent loop continues)
-2. ClarificationMiddleware — intercepts ask_clarification and interrupts execution
-3. SubagentLimitMiddleware — truncates excess parallel task calls from model response
+Four critical middleware patterns that control agent flow:
+1. ToolErrorHandlingMiddleware -- converts exceptions to ToolMessages (agent loop continues)
+2. ClarificationMiddleware -- intercepts ask_clarification and interrupts execution
+3. SubagentLimitMiddleware -- truncates excess parallel task calls from model response
+4. LoopDetectionMiddleware -- detects and breaks repetitive tool call patterns
 
-Source: backend/src/agents/middlewares/
+Source: backend/packages/harness/deerflow/agents/middlewares/
 """
 
-# --- Pattern 1: Tool Error → ToolMessage (Non-Crashing Loop) ---
+# --- Pattern 1: Tool Error -> ToolMessage (Non-Crashing Loop) ---
 # Wraps every tool call. On failure, returns an error ToolMessage instead of
 # raising, so the agent can inspect the error and try alternatives.
 
@@ -79,23 +80,54 @@ class SubagentLimitMiddleware(AgentMiddleware):
         return {"messages": [updated_msg]}
 
 
-# --- Middleware for Subagent vs Lead ---
-# Lead and subagent share base middlewares but differ in optional ones.
+# --- Pattern 4: Loop Detection & Breaking ---
+# Hash-based detection of repetitive tool call patterns. Two-phase response:
+# 1. Warning (after warn_threshold identical patterns): inject system message
+# 2. Hard stop (after hard_limit): strip tool_calls, force text output
+# Prevents doom loops and runaway costs.
 
-def build_lead_runtime_middlewares():
-    return [
-        ThreadDataMiddleware(),
-        UploadsMiddleware(),          # lead only: handles file uploads
-        SandboxMiddleware(),
-        DanglingToolCallMiddleware(), # lead only: patches interrupted tool calls
-        ToolErrorHandlingMiddleware(),
-    ]
+class LoopDetectionMiddleware(AgentMiddleware):
+    def __init__(self, warn_threshold=3, hard_limit=5, window_size=20):
+        self.warn_threshold = warn_threshold
+        self.hard_limit = hard_limit
+        self.window_size = window_size
+        # Per-thread tracking with LRU eviction (max 100 threads)
+        self._thread_histories: dict[str, list[int]] = {}
+        self._lock = threading.Lock()
 
-def build_subagent_runtime_middlewares():
-    return [
-        ThreadDataMiddleware(),
-        SandboxMiddleware(),
-        # no UploadsMiddleware (subagents don't handle uploads)
-        # no DanglingToolCallMiddleware (subagents start fresh)
-        ToolErrorHandlingMiddleware(),
-    ]
+    def _hash_tool_calls(self, tool_calls: list[dict]) -> int:
+        """Hash the multiset of (name, args) tuples for order-independent matching."""
+        items = sorted((tc["name"], json.dumps(tc["args"], sort_keys=True)) for tc in tool_calls)
+        return hash(tuple(items))
+
+    def after_model(self, state, runtime):
+        last_msg = state["messages"][-1]
+        tool_calls = getattr(last_msg, "tool_calls", [])
+        if not tool_calls:
+            return None
+
+        thread_id = runtime.config.get("configurable", {}).get("thread_id", "default")
+        call_hash = self._hash_tool_calls(tool_calls)
+
+        with self._lock:
+            history = self._thread_histories.setdefault(thread_id, [])
+            history.append(call_hash)
+            # Sliding window: keep only last N
+            if len(history) > self.window_size:
+                history[:] = history[-self.window_size:]
+            repeat_count = history.count(call_hash)
+
+        if repeat_count >= self.hard_limit:
+            # Hard stop: strip tool_calls, force text output
+            updated_msg = last_msg.model_copy(update={"tool_calls": []})
+            return {"messages": [updated_msg]}
+
+        if repeat_count >= self.warn_threshold:
+            # Warning: inject system message asking agent to stop
+            warning = SystemMessage(
+                content="[LOOP DETECTED] You are repeating the same tool calls. "
+                        "Stop calling tools and produce your final answer."
+            )
+            return {"messages": [warning]}
+
+        return None

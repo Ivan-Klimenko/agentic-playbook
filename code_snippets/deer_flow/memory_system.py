@@ -3,12 +3,14 @@ DeerFlow Long-Term Memory System
 
 Persistent cross-session memory with LLM-powered updates. Key patterns:
 - Structured JSON with user context, history timeline, and confidence-scored facts
-- Debounced async updates (30s window) to batch multiple conversations
+- Debounced async updates via configurable window to batch multiple conversations
 - Token-budgeted injection into system prompt (max 2000 tokens)
 - Facts ranked by confidence, oldest/lowest pruned at max_facts limit
 - Upload mentions stripped to prevent ghost file references
+- Per-agent memory isolation supported via agent_name parameter
 
-Source: backend/src/agents/memory/updater.py, backend/src/agents/memory/prompt.py
+Source: backend/packages/harness/deerflow/agents/memory/updater.py,
+        backend/packages/harness/deerflow/agents/memory/prompt.py
 """
 
 # --- Memory Schema ---
@@ -69,7 +71,7 @@ def format_memory_for_injection(memory_data: dict, max_tokens: int = 2000) -> st
 
 
 # --- Memory Update (LLM-Powered) ---
-# Conversation → LLM extracts updates → merge into existing memory.
+# Conversation -> LLM extracts updates -> merge into existing memory.
 
 class MemoryUpdater:
     def update_memory(self, messages, thread_id=None, agent_name=None) -> bool:
@@ -99,6 +101,34 @@ class MemoryUpdater:
         return _save_memory_to_file(updated, agent_name)
 
 
+# --- Async Update Queue (Debounced) ---
+# Batches memory updates to avoid thrashing. Only last update per thread retained.
+
+class MemoryUpdateQueue:
+    def __init__(self, updater: MemoryUpdater, debounce_seconds: float = 30.0):
+        self._updater = updater
+        self._debounce = debounce_seconds
+        self._queue: dict[str, tuple[list, str | None]] = {}  # thread_id -> (messages, agent_name)
+        self._lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+
+    def enqueue(self, thread_id: str, messages: list, agent_name: str | None = None):
+        with self._lock:
+            self._queue[thread_id] = (messages, agent_name)
+            if self._timer is None:
+                self._timer = threading.Timer(self._debounce, self._flush)
+                self._timer.start()
+
+    def _flush(self):
+        with self._lock:
+            pending = dict(self._queue)
+            self._queue.clear()
+            self._timer = None
+
+        for thread_id, (messages, agent_name) in pending.items():
+            self._updater.update_memory(messages, thread_id, agent_name)
+
+
 # --- Caching with Staleness Detection ---
 # Memory loaded from disk with mtime-based cache invalidation.
 
@@ -110,7 +140,7 @@ def get_memory_data(agent_name=None) -> dict:
 
     cached = _memory_cache.get(agent_name)
     if cached is None or cached[1] != current_mtime:
-        # Cache miss or stale — reload from disk
+        # Cache miss or stale -- reload from disk
         data = _load_memory_from_file(agent_name)
         _memory_cache[agent_name] = (data, current_mtime)
         return data

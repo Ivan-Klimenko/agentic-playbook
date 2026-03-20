@@ -9,11 +9,12 @@ and polls for completion via SSE events. Key design decisions:
 - Parent shares sandbox/thread_data but NOT messages or memory
 - Two-pool architecture: scheduler pool + execution pool for timeout support
 
-Source: backend/src/subagents/executor.py, backend/src/tools/builtins/task_tool.py
+Source: backend/packages/harness/deerflow/subagents/executor.py,
+        backend/packages/harness/deerflow/tools/builtins/task_tool.py
 """
 
 # --- Subagent Result ---
-# Tracks lifecycle from PENDING → RUNNING → COMPLETED|FAILED|TIMED_OUT
+# Tracks lifecycle from PENDING -> RUNNING -> COMPLETED|FAILED|TIMED_OUT
 
 @dataclass
 class SubagentResult:
@@ -43,7 +44,7 @@ _background_tasks_lock = threading.Lock()
 class SubagentExecutor:
     def __init__(self, config, tools, parent_model, sandbox_state, thread_data, thread_id, trace_id):
         # Filter tools: apply allowlist then denylist from subagent config
-        # task, ask_clarification, present_files are always denied → no nesting
+        # task, ask_clarification, present_files are always denied -> no nesting
         self.tools = _filter_tools(tools, config.tools, config.disallowed_tools)
 
     def execute_async(self, task: str, task_id: str | None = None) -> str:
@@ -86,12 +87,12 @@ class SubagentExecutor:
 
 
 # --- Task Tool (Polling Bridge) ---
-# The task tool bridges lead agent ↔ background subagent via polling loop.
+# The task tool bridges lead agent <-> background subagent via polling loop.
 
 @tool("task")
 def task_tool(runtime, description, prompt, subagent_type, tool_call_id, max_turns=None):
     """Delegate a task to a subagent running in background thread pool."""
-    # Get tools WITHOUT task tool → prevents nesting
+    # Get tools WITHOUT task tool -> prevents nesting
     tools = get_available_tools(model_name=parent_model, subagent_enabled=False)
 
     executor = SubagentExecutor(
