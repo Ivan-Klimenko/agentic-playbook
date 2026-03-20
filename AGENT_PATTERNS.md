@@ -754,6 +754,41 @@ Agent working on multi-step task:
 
 **When NOT to auto-continue:** When compaction was user-initiated (they explicitly asked to reset/summarize). In that case, the user likely wants to steer the conversation, not have the agent barrel ahead.
 
+### 3.11 Periodic Self-Check Injection (Cognitive Checkpoints)
+
+Distinct from the [Think Tool (§3.6)](#36-think-tool-no-op-forced-reflection) which is agent-initiated. Self-check injection is **system-initiated** at fixed intervals, providing resource-aware reflection prompts:
+
+```python
+REMINDER_INTERVAL = 50  # Every 50 rounds
+
+if round_idx > 1 and round_idx % REMINDER_INTERVAL == 0:
+    messages.append({"role": "system", "content": f"""
+[CHECKPOINT {round_idx // REMINDER_INTERVAL} — round {round_idx}/{max_rounds}]
+📊 Context: ~{ctx_tokens} tokens | Cost: ${task_cost:.2f} | Remaining: {max_rounds - round_idx} rounds
+
+⏸️ PAUSE AND REFLECT:
+1. Am I making real progress, or repeating the same actions?
+2. Is my current strategy working? Should I try something different?
+3. Is my context bloated? → call `compact_context` to compress old results.
+4. Have I been stuck on the same sub-problem for many rounds?
+5. Should I just STOP and return my best result so far?
+
+This is not a hard limit — you decide. But be honest with yourself.
+"""})
+```
+
+**Key differences from Think Tool:**
+- **System-injected** at intervals vs agent-initiated on demand
+- **Resource-aware**: includes token count, cost, remaining rounds — gives the agent data for its decision
+- **Non-blocking**: a system message, not a tool call. The agent reads it and decides whether to change course
+- **Soft, not hard**: explicitly says "you decide" — the agent can ignore it if progress is good
+
+**Why it works:** Long-running ReAct loops often drift into repetitive patterns (doom loops) without the agent noticing. The checkpoint provides a natural breakpoint for metacognition, while the resource stats make the cost of continuing visible. This is cheaper than a dedicated reflection LLM call — it's just a system message that gets processed in the next regular call.
+
+**Combine with:** [Tool Loop Detection (PRODUCTION_PATTERNS §10)](./PRODUCTION_PATTERNS.md#10-tool-loop-detection-pattern-based-not-hard-caps) for pattern-based detection, and `compact_context` tool for LLM-driven context management.
+
+> Source: [Ouroboros](./inspections/ouroboros.md) — `loop.py:_maybe_inject_self_check`
+
 ---
 
 ## 4. Prompt Engineering for Agents
@@ -840,6 +875,7 @@ Instruct parallel execution explicitly: *"When you identify multiple independent
 - [OpenCode Architecture](./inspections/opencode.md) — agents-as-config, fuzzy edit matching, permission-as-data, prompt-driven planning, batch tool, snapshot/revert
 - [OpenClaw Architecture](./inspections/openclaw.md) — multi-channel agent platform, tool policy pipeline, auth failover, dual-loop, HITL
 - [DeerFlow Inspection](./inspections/deer_flow.md) — middleware chain architecture, subagent executor with background pools, memory system with upload scrubbing, post-model guardrails
+- [Ouroboros Inspection](./inspections/ouroboros.md) — self-modifying agent with background consciousness, LLM-controlled model switching, periodic self-check injection, budget drift detection
 
 ### Tutorials
 - [deep-agents-from-scratch](../deep-agents-from-scratch/) — progressive tutorial: TODO anchoring → virtual filesystem → sub-agents → full research agent
