@@ -1,215 +1,205 @@
 /**
- * Sub-Agent Depth-Aware Tool Restrictions
+ * Sub-Agent Depth-Aware Capability Resolution
  *
- * Pattern: Restrict sub-agent capabilities based on spawn depth.
- * From: OpenClaw src/agents/pi-tools.policy.ts, subagent-spawn.ts
+ * Pattern: 3-role model (main/orchestrator/leaf) with control scope and
+ * persistent capability storage for sub-agent sessions.
+ * From: OpenClaw src/agents/subagent-capabilities.ts, src/agents/subagent-depth.ts
  *
  * Key ideas:
- * - Always-denied tools for ALL sub-agents (system admin, memory, direct sends)
- * - Additional denials for leaf sub-agents (spawning, session management)
- * - Max spawn depth and max children per agent
- * - Cross-agent spawning requires explicit allowlist
+ * - 3 roles: main (depth 0), orchestrator (0 < depth < max), leaf (depth >= max)
+ * - Control scope: "children" (can spawn/manage) vs "none" (leaf, no spawning)
+ * - Capabilities resolved from depth OR loaded from persisted session store
+ * - Persisted roles survive restarts — store overrides computed role
+ * - Depth resolution walks the spawnedBy chain for inherited depth
+ * - Always-denied + leaf-denied tool lists remain (see tool_policy_pipeline.ts)
  */
 
-// --- Constants ---
+// --- Roles & Control Scope ---
+
+const SUBAGENT_SESSION_ROLES = ["main", "orchestrator", "leaf"] as const;
+type SubagentSessionRole = (typeof SUBAGENT_SESSION_ROLES)[number];
+
+const SUBAGENT_CONTROL_SCOPES = ["children", "none"] as const;
+type SubagentControlScope = (typeof SUBAGENT_CONTROL_SCOPES)[number];
 
 const DEFAULT_MAX_SPAWN_DEPTH = 2;
-const DEFAULT_MAX_CHILDREN_PER_AGENT = 5;
+
+// --- Capability Bundle ---
+
+interface SubagentCapabilities {
+  depth: number;
+  role: SubagentSessionRole;
+  controlScope: SubagentControlScope;
+  canSpawn: boolean;           // main or orchestrator
+  canControlChildren: boolean; // controlScope === "children"
+}
+
+// --- Pure resolution from depth ---
+
+/** Map depth to role. depth=0 is main, depth<max is orchestrator, else leaf. */
+function resolveSubagentRoleForDepth(params: {
+  depth: number;
+  maxSpawnDepth?: number;
+}): SubagentSessionRole {
+  const depth = Math.max(0, Math.floor(params.depth));
+  const maxSpawnDepth = Math.max(1, Math.floor(params.maxSpawnDepth ?? DEFAULT_MAX_SPAWN_DEPTH));
+
+  if (depth <= 0) return "main";
+  return depth < maxSpawnDepth ? "orchestrator" : "leaf";
+}
+
+/** Leaf agents get "none" scope — they cannot spawn or manage children. */
+function resolveSubagentControlScopeForRole(role: SubagentSessionRole): SubagentControlScope {
+  return role === "leaf" ? "none" : "children";
+}
+
+/** Compute full capability bundle from depth alone. */
+function resolveSubagentCapabilities(params: {
+  depth: number;
+  maxSpawnDepth?: number;
+}): SubagentCapabilities {
+  const role = resolveSubagentRoleForDepth(params);
+  const controlScope = resolveSubagentControlScopeForRole(role);
+  return {
+    depth: Math.max(0, Math.floor(params.depth)),
+    role,
+    controlScope,
+    canSpawn: role === "main" || role === "orchestrator",
+    canControlChildren: controlScope === "children",
+  };
+}
+
+// --- Persistent capability resolution ---
 
 /**
- * Tools always denied for sub-agents regardless of depth.
- * These are system-level or interactive tools that sub-agents should never use.
+ * Session store entries may have persisted role and control scope from
+ * a prior run. This allows capabilities to survive gateway restarts.
  */
-const SUBAGENT_DENY_ALWAYS = [
-  // System admin
-  "gateway",
-  "agents_list",
-  // Interactive setup
-  "whatsapp_login",
-  // Status/scheduling — main agent coordinates these
-  "session_status",
-  "cron",
-  // Memory — pass relevant info in spawn prompt instead
-  "memory_search",
-  "memory_get",
-  // Direct session sends — sub-agents communicate through announce chain
-  "sessions_send",
-];
+interface SessionCapabilityEntry {
+  sessionId?: string;
+  spawnDepth?: number;
+  spawnedBy?: string;            // parent session key (for chain walk)
+  subagentRole?: string;         // persisted role override
+  subagentControlScope?: string; // persisted scope override
+}
 
 /**
- * Additional tools denied for leaf sub-agents (depth >= maxSpawnDepth).
- * Leaf agents can't orchestrate, so they don't need spawn/session tools.
+ * Resolve capabilities with store fallback.
+ *
+ * Priority:
+ *   1. Stored role/scope from session store (survives restarts)
+ *   2. Computed from depth (fresh spawn or missing store data)
+ *
+ * Why persist? After a gateway reload, the in-memory depth chain is lost.
+ * The store preserves the role so the sub-agent doesn't accidentally get
+ * elevated capabilities.
  */
-const SUBAGENT_DENY_LEAF = [
-  "sessions_list",
-  "sessions_history",
-  "sessions_spawn",
-];
+function resolveStoredSubagentCapabilities(
+  sessionKey: string,
+  store: Record<string, SessionCapabilityEntry>,
+  maxSpawnDepth: number,
+): SubagentCapabilities {
+  // Walk spawnedBy chain to resolve depth from store
+  const depth = getSubagentDepthFromStore(sessionKey, store);
 
-// --- Types ---
+  // Compute baseline from depth
+  const fallback = resolveSubagentCapabilities({ depth, maxSpawnDepth });
 
-interface SubagentConfig {
-  maxSpawnDepth: number;
-  maxChildrenPerAgent: number;
-  allowAgents?: string[]; // Cross-agent spawn allowlist
+  // Check for persisted overrides
+  const entry = store[sessionKey];
+  const storedRole = normalizeRole(entry?.subagentRole);
+  const storedControlScope = normalizeControlScope(entry?.subagentControlScope);
+
+  const role = storedRole ?? fallback.role;
+  const controlScope = storedControlScope ?? resolveSubagentControlScopeForRole(role);
+
+  return {
+    depth,
+    role,
+    controlScope,
+    canSpawn: role === "main" || role === "orchestrator",
+    canControlChildren: controlScope === "children",
+  };
 }
 
-interface ToolPolicy {
-  allow?: string[];
-  deny: string[];
-}
+// --- Depth chain walk ---
 
-interface SpawnValidation {
-  allowed: boolean;
-  reason?: string;
-}
+/**
+ * Resolve depth by walking the spawnedBy chain in the session store.
+ * Handles cycles via visited set. Falls back to key-based heuristic
+ * (counting ":subagent:" segments) when store data is incomplete.
+ */
+function getSubagentDepthFromStore(
+  sessionKey: string,
+  store: Record<string, SessionCapabilityEntry>,
+): number {
+  const visited = new Set<string>();
 
-// --- Depth-aware deny list ---
+  const walk = (key: string): number | undefined => {
+    if (visited.has(key)) return undefined; // cycle guard
+    visited.add(key);
 
-function resolveSubagentDenyList(depth: number, maxSpawnDepth: number): string[] {
-  const isLeaf = depth >= Math.max(1, Math.floor(maxSpawnDepth));
-
-  if (isLeaf) {
-    // Leaf agent: deny system tools + orchestration tools
-    return [...SUBAGENT_DENY_ALWAYS, ...SUBAGENT_DENY_LEAF];
-  }
-
-  // Orchestrator sub-agent: only deny system tools
-  // sessions_spawn, sessions_list, sessions_history remain allowed
-  return [...SUBAGENT_DENY_ALWAYS];
-}
-
-function resolveSubagentToolPolicy(
-  config: SubagentConfig,
-  depth: number,
-  explicitAllow?: string[],
-): ToolPolicy {
-  const baseDeny = resolveSubagentDenyList(depth, config.maxSpawnDepth);
-
-  // Explicit allow overrides can remove items from deny list
-  const allowSet = new Set((explicitAllow ?? []).map((t) => t.toLowerCase()));
-  const effectiveDeny = baseDeny.filter((tool) => !allowSet.has(tool.toLowerCase()));
-
-  return { deny: effectiveDeny };
-}
-
-// --- Spawn validation ---
-
-function validateSpawn(params: {
-  callerDepth: number;
-  activeChildren: number;
-  callerAgentId: string;
-  targetAgentId: string;
-  config: SubagentConfig;
-}): SpawnValidation {
-  const { callerDepth, activeChildren, callerAgentId, targetAgentId, config } = params;
-
-  // Check depth limit
-  if (callerDepth >= config.maxSpawnDepth) {
-    return {
-      allowed: false,
-      reason:
-        `Spawn denied: current depth ${callerDepth} >= max ${config.maxSpawnDepth}`,
-    };
-  }
-
-  // Check children limit
-  if (activeChildren >= config.maxChildrenPerAgent) {
-    return {
-      allowed: false,
-      reason:
-        `Spawn denied: ${activeChildren}/${config.maxChildrenPerAgent} active children`,
-    };
-  }
-
-  // Check cross-agent allowlist
-  if (targetAgentId !== callerAgentId) {
-    const allowAgents = config.allowAgents ?? [];
-    const allowAny = allowAgents.includes("*");
-    const allowSet = new Set(allowAgents.map((a) => a.toLowerCase()));
-
-    if (!allowAny && !allowSet.has(targetAgentId.toLowerCase())) {
-      return {
-        allowed: false,
-        reason:
-          `Cross-agent spawn denied: "${targetAgentId}" not in allowAgents ` +
-          `(allowed: ${allowAgents.join(", ") || "none"})`,
-      };
+    const entry = store[key];
+    if (typeof entry?.spawnDepth === "number" && entry.spawnDepth >= 0) {
+      return entry.spawnDepth;
     }
-  }
 
-  return { allowed: true };
+    // Walk up the parent chain
+    const parentKey = entry?.spawnedBy?.trim();
+    if (!parentKey) return undefined;
+
+    const parentDepth = walk(parentKey);
+    if (parentDepth !== undefined) return parentDepth + 1;
+
+    // Fallback: infer from parent key structure
+    return getSubagentDepthFromKey(parentKey) + 1;
+  };
+
+  return walk(sessionKey) ?? getSubagentDepthFromKey(sessionKey);
 }
 
-// --- Sub-agent session key ---
-
-function buildSubagentSessionKey(
-  targetAgentId: string,
-): string {
-  const uuid = crypto.randomUUID();
-  return `agent:${targetAgentId}:subagent:${uuid}`;
+/** Heuristic: count ":subagent:" segments in session key to infer depth. */
+function getSubagentDepthFromKey(sessionKey: string): number {
+  return (sessionKey.match(/:subagent:/g) || []).length;
 }
 
-// --- Context message for sub-agent ---
+// --- Helpers ---
 
-function buildSubagentContextMessage(params: {
-  task: string;
-  childDepth: number;
-  maxSpawnDepth: number;
-  isPersistent: boolean;
-}): string {
-  const lines = [
-    `[Subagent Context] You are running as a subagent ` +
-      `(depth ${params.childDepth}/${params.maxSpawnDepth}). ` +
-      `Results auto-announce to your requester; do not busy-poll for status.`,
-  ];
+function normalizeRole(value: unknown): SubagentSessionRole | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim().toLowerCase();
+  return SUBAGENT_SESSION_ROLES.find((r) => r === trimmed);
+}
 
-  if (params.isPersistent) {
-    lines.push(
-      "[Subagent Context] This subagent session is persistent " +
-        "and remains available for thread follow-up messages.",
-    );
-  }
-
-  lines.push(`[Subagent Task]: ${params.task}`);
-
-  return lines.join("\n\n");
+function normalizeControlScope(value: unknown): SubagentControlScope | undefined {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim().toLowerCase();
+  return SUBAGENT_CONTROL_SCOPES.find((s) => s === trimmed);
 }
 
 // --- Usage example ---
 
 /*
-const config: SubagentConfig = {
-  maxSpawnDepth: 3,
-  maxChildrenPerAgent: 5,
-  allowAgents: ["coding-agent", "research-agent"],
+// Fresh spawn at depth 1:
+const caps = resolveSubagentCapabilities({ depth: 1, maxSpawnDepth: 3 });
+// caps = { depth: 1, role: "orchestrator", controlScope: "children",
+//          canSpawn: true, canControlChildren: true }
+
+// Leaf at max depth:
+const leaf = resolveSubagentCapabilities({ depth: 3, maxSpawnDepth: 3 });
+// leaf = { depth: 3, role: "leaf", controlScope: "none",
+//          canSpawn: false, canControlChildren: false }
+
+// After gateway restart, resolve from persisted store:
+const store = {
+  "agent:coding:subagent:abc": {
+    spawnDepth: 1,
+    subagentRole: "orchestrator",
+    subagentControlScope: "children",
+  },
 };
-
-// Main agent (depth 0) spawns orchestrator sub-agent
-const validation = validateSpawn({
-  callerDepth: 0,
-  activeChildren: 1,
-  callerAgentId: "main",
-  targetAgentId: "coding-agent",
-  config,
-});
-// validation.allowed === true
-
-// Get tool policy for the child (depth 1, orchestrator)
-const orchestratorPolicy = resolveSubagentToolPolicy(config, 1);
-// orchestratorPolicy.deny = SUBAGENT_DENY_ALWAYS (can still spawn)
-
-// Orchestrator sub-agent spawns leaf (depth 2)
-const leafPolicy = resolveSubagentToolPolicy(config, 2);
-// leafPolicy.deny = SUBAGENT_DENY_ALWAYS + SUBAGENT_DENY_LEAF (can't spawn)
-
-// Depth 3 spawn attempt from leaf → blocked
-const blocked = validateSpawn({
-  callerDepth: 3,
-  activeChildren: 0,
-  callerAgentId: "coding-agent",
-  targetAgentId: "coding-agent",
-  config,
-});
-// blocked.allowed === false, blocked.reason = "depth 3 >= max 3"
+const restored = resolveStoredSubagentCapabilities(
+  "agent:coding:subagent:abc", store, 3,
+);
+// restored.role === "orchestrator" (from store, not recomputed)
 */

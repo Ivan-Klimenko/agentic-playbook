@@ -66,15 +66,18 @@ Multi-agent orchestration topologies — how to wire agents together. Adapted fr
 
 Production infrastructure for agent platforms — extracted from [OpenClaw](./inspections/openclaw.md) (628K-LOC TypeScript).
 
-- **Auth profile failover** with cooldown rotation
+- **Auth profile failover** with cooldown rotation and transient probing
 - **7-layer tool policy pipeline** (profile, provider, global, agent, group)
-- **Depth-aware sub-agent restrictions**
-- **3-tier context window recovery** (compact, re-compact, truncate)
+- **Depth-aware sub-agent restrictions** with role-based capabilities (main/orchestrator/leaf)
+- **5-tier context window recovery** (compact, re-compact, truncate, downgrade thinking, rotate model)
+- **Pluggable context engine** abstraction (ingest, assemble, compact lifecycle)
 - **Concurrency lanes** (nested queue serialization)
-- **Plugin lifecycle hooks** (typed, priority-ordered, sync-only hot paths)
+- **Plugin lifecycle hooks** (25 typed hooks, priority-ordered, sync-only hot paths)
 - **Hybrid memory search** (vector + FTS + temporal decay + MMR)
-- **Command sandboxing** (safe-bin profiles with flag restrictions)
-- **Defense-in-depth security** (9-layer stack)
+- **Subagent registry** with announce dispatch, orphan recovery, frozen result capture
+- **Command sandboxing** (safe-bin profiles with flag restrictions, GNU abbreviation resolution)
+- **Defense-in-depth security** (10-layer stack)
+- **Session write locking** with PID recycling detection, watchdog, signal-safe cleanup
 - **Channel plugin architecture** (modular adapters)
 
 ### [PROJECT_INSPECTION.md](./PROJECT_INSPECTION.md)
@@ -106,13 +109,25 @@ Implementation patterns extracted from inspected projects:
 
 ```
 code_snippets/openclaw/          (TypeScript)
-  auth_failover.ts
-  tool_policy_pipeline.ts
-  subagent_depth_policy.ts
-  context_overflow_recovery.ts
-  lifecycle_hooks.ts
-  hybrid_memory_search.ts
-  sandbox_security.ts
+  auth_failover.ts              — auth profile rotation with cooldown and transient probing
+  tool_policy_pipeline.ts       — 7-layer composable tool access control
+  subagent_depth_policy.ts      — role-based capabilities (main/orchestrator/leaf) with control scope
+  subagent_registry.ts          — lifecycle registry with announce dispatch and orphan recovery
+  context_overflow_recovery.ts  — 5-tier recovery (compact, truncate head+tail, downgrade, rotate)
+  context_engine.ts             — pluggable context engine interface with registry
+  compaction_algorithm.ts       — staged summarization with adaptive chunking and identifier preservation
+  session_write_lock.ts         — file-based locking with PID recycling detection and watchdog
+  tool_loop_detection.ts        — 4-layer pattern detection (repeat, poll, ping-pong, circuit breaker)
+  tool_policy_pipeline.ts       — 7-layer tool access control with glob matching
+  lifecycle_hooks.ts            — 25 typed hooks (void/modifying/claiming execution models)
+  hybrid_memory_search.ts       — vector + FTS merge with temporal decay and MMR diversity
+  sandbox_security.ts           — safe-bin profiles, Docker isolation, bind mount validation
+  dynamic_system_prompt.ts      — conditional assembly with 3 prompt modes
+  prompt_injection_defense.ts   — 4-layer defense (sanitize, detect, wrap, prevent spoofing)
+  tool_result_sanitization.ts   — details stripping, semantic summarization
+  thinking_block_management.ts  — strip from history, multi-level config, empty turn preservation
+  response_directives.ts        — inline output routing ([[reply_to]], MEDIA:, silence)
+  dual_loop_architecture.ts     — outer retry/recovery + inner tool execution loop
 
 code_snippets/opencode/          (TypeScript)
   agent_definition.ts       — agent-as-config schema, permission merging, custom agent loading

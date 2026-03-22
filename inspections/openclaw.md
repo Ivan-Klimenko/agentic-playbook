@@ -12,8 +12,10 @@ OpenClaw is a **gateway-centric agent orchestration platform** that connects LLM
 - Single gateway process orchestrates all agents, channels, and plugins
 - Agents run in-process via embedded PI agent SDK (not microservices)
 - Tool access controlled by layered policy pipeline
-- Sub-agents spawn within sessions with depth-limited recursion
+- Sub-agents spawn within sessions with depth-limited recursion and role-based capability restrictions
+- ACP (Agent Communication Protocol) provides an alternative external-process spawn model
 - Memory persisted as workspace files with vector+FTS hybrid search
+- Pluggable context engine abstraction for custom compaction strategies
 - Docker-based sandbox isolation for untrusted execution
 
 ```
@@ -27,6 +29,11 @@ OpenClaw is a **gateway-centric agent orchestration platform** that connects LLM
 │  ┌────▼──────────────▼──────────────▼─────────────▼────┐ │
 │  │              Unified Tool System                     │ │
 │  │  (policy pipeline → hooks → execution → sandbox)    │ │
+│  └─────────────────────┬───────────────────────────────┘ │
+│                        │                                 │
+│  ┌─────────────────────▼───────────────────────────────┐ │
+│  │              Context Engine (pluggable)              │ │
+│  │  (ingest → assemble → compact → maintain)           │ │
 │  └─────────────────────┬───────────────────────────────┘ │
 │                        │                                 │
 │  ┌─────────────────────▼───────────────────────────────┐ │
@@ -83,6 +90,7 @@ Inbound Message (Slack/Discord/Telegram/...)
 │  │ Tool Execution      │                       │
 │  │ - Policy validation │                       │
 │  │ - Pre-call hooks    │                       │
+│  │ - Loop detection    │                       │
 │  │ - Sandbox enforce   │                       │
 │  │ - Post-call hooks   │                       │
 │  └─────────┬──────────┘                       │
@@ -94,8 +102,9 @@ Inbound Message (Slack/Discord/Telegram/...)
 │  │ end_turn → extract  │                       │
 │  └────────────────────┘                       │
 │                                               │
-│  Context Overflow? → Compaction (3-tier)       │
+│  Context Overflow? → 5-tier recovery           │
 │  Auth Error? → Profile failover rotation       │
+│  Model Error? → Model fallback chain           │
 └──────────────────┬───────────────────────────┘
                    │
                    ▼
@@ -125,9 +134,9 @@ Inbound Message (Slack/Discord/Telegram/...)
 The agent doesn't run as a separate process — it's embedded in the gateway via the PI agent SDK. A bounded retry loop wraps each run with auth profile failover.
 
 **Key design decisions:**
-- Max retry iterations scale with number of auth profiles: `24 base + 8 per profile`
+- Max retry iterations scale with number of auth profiles: `24 base + 8 per profile` (min 32, max 160)
 - Auth profiles rotate on failure with cooldown tracking (prevent hammering a failing provider)
-- Context overflow triggers 3-tier recovery before giving up
+- Context overflow triggers 5-tier recovery before giving up
 - Tool calls stream through subscription-based event system
 
 ```
@@ -154,7 +163,7 @@ Tool access is controlled by a layered pipeline — each layer can filter the av
 
 | # | Layer | Source | Purpose |
 |---|-------|--------|---------|
-| 1 | Profile policy | `tools.profile` | Named config profiles (e.g. "minimal") |
+| 1 | Profile policy | `tools.profile` | Named config profiles (e.g. "minimal", "coding", "messaging", "full") |
 | 2 | Provider profile | `tools.byProvider.profile` | Per-LLM-provider restrictions |
 | 3 | Global allow | `tools.allow` | System-wide tool allowlist |
 | 4 | Global provider | `tools.byProvider.allow` | Provider-specific global list |
@@ -162,73 +171,97 @@ Tool access is controlled by a layered pipeline — each layer can filter the av
 | 6 | Agent provider | `agents.{id}.tools.byProvider.allow` | Per-agent per-provider |
 | 7 | Group policy | Group `tools.allow` | Per-user-group restrictions |
 
-**Each layer** uses glob patterns for matching (`exec*`, `sessions_*`), supports allow and deny lists, and handles plugin tool groups separately from core tools.
+**Each layer** uses glob patterns for matching (`exec*`, `sessions_*`), supports allow and deny lists, handles plugin tool groups (`group:plugins`, `group:fs`, etc.) separately from core tools, and strips plugin-only allowlists to prevent accidental core tool disablement.
 
 See: `src/agents/tool-policy-pipeline.ts`
 
-### 3.3 Sub-Agent Spawning with Depth Control
+### 3.3 Dual Spawn Model: Sub-Agents vs ACP
 
-Sub-agents are first-class: spawned within parent sessions, tracked in a registry, with depth-limited recursion and per-depth tool restrictions.
+OpenClaw supports two distinct spawn models for child agents:
 
-**Key constraints:**
-- `maxSpawnDepth` (default: configurable) prevents infinite recursion
-- `maxChildrenPerAgent` limits concurrent children per session
-- Leaf agents (at max depth) lose spawning and session management tools
-- Orchestrator sub-agents (depth < max) keep spawn capability
-- Cross-agent spawning requires explicit `allowAgents` config
-- Each sub-agent gets its own session key: `agent:{agentId}:subagent:{uuid}`
+**Sub-Agents (embedded, hierarchical):**
+- Run embedded within the same gateway process
+- Depth-limited recursion with role-based capability restrictions
+- Push-based announce/completion mechanism
+- Parent can kill or steer children
+- `maxSpawnDepth` prevents infinite recursion; `maxChildrenPerAgent` limits concurrency
+- Three roles: `main` (depth 0), `orchestrator` (0 < depth < max), `leaf` (depth ≥ max)
+- Leaf agents lose spawning and session management tools
 
-**Tool deny rules by depth:**
+**ACP (external-process, protocol-based):**
+- Runs on host as external process via Agent Communication Protocol
+- Supports oneshot (`run`) and persistent (`session`) modes
+- Optional parent stream relay (2.5s flush, 60s stall notice, 6h max lifetime)
+- Cannot spawn from sandboxed sessions (ACP runs on host)
+- Thread binding support for Discord/Slack
+- JSONL stream logs at `{sessionFile}.acp-stream.jsonl`
+
+**Tool deny rules by depth (sub-agents):**
 ```
 Always denied (all sub-agents):
   gateway, agents_list, whatsapp_login, session_status,
   cron, memory_search, memory_get, sessions_send
 
 Additionally denied (leaf sub-agents, depth >= max):
-  sessions_list, sessions_history, sessions_spawn
+  subagents, sessions_list, sessions_history, sessions_spawn
 ```
 
-See: `src/agents/subagent-spawn.ts`, `src/agents/pi-tools.policy.ts`
+See: `src/agents/subagent-spawn.ts`, `src/agents/acp-spawn.ts`, `src/agents/subagent-capabilities.ts`
 
-### 3.4 Context Window Overflow: 3-Tier Recovery
+### 3.4 Context Window Overflow: 5-Tier Recovery
 
-When the context window fills up, the system doesn't just fail — it has three escalating recovery strategies:
+When the context window fills up, the system has five escalating recovery strategies:
 
 ```
 Tier 1: In-Attempt Auto-Compaction
   └─ SDK detects overflow during tool loop, compacts automatically
-  └─ If overflow persists → retry without extra compaction (up to MAX attempts)
+  └─ If overflow persists → retry without extra compaction (up to 3 attempts)
 
 Tier 2: Explicit Overflow Compaction
   └─ Gateway triggers external compaction (summarize older messages)
   └─ Increments compaction counter
-  └─ If compacted → retry prompt
+  └─ If compacted → retry prompt (up to MAX_OVERFLOW_COMPACTION_ATTEMPTS=3)
 
 Tier 3: Tool Result Truncation
-  └─ Identify oversized tool results (e.g. a huge file read)
-  └─ Truncate them to fit within context window
+  └─ Identify oversized tool results (>30% of context window)
+  └─ Smart truncation: head+tail strategy for error-bearing results
   └─ If truncated → retry prompt
+
+Tier 4: Thinking Level Downgrade
+  └─ Reduce extended thinking budget
+  └─ Frees token budget for content
+
+Tier 5: Auth Profile Rotation
+  └─ Switch to a different model/provider
+  └─ May have a larger context window
 ```
 
-See: `src/agents/pi-embedded-runner/run.ts`, `compact.ts`
+See: `src/agents/pi-embedded-runner/run.ts`, `src/agents/compaction.ts`, `src/agents/pi-embedded-runner/tool-result-truncation.ts`
 
 ### 3.5 Plugin Lifecycle Hook System
 
-25+ typed lifecycle hooks with priority-ordered execution. Hooks are either fire-and-forget (parallel) or sequential (modifying). Two hooks are synchronous-only for hot-path performance.
+25 typed lifecycle hooks with priority-ordered execution. Hooks are either fire-and-forget (parallel), sequential (modifying), or first-wins (claiming).
 
 **Hook categories:**
 
 | Phase | Hooks | Execution |
 |-------|-------|-----------|
-| Agent lifecycle | `before_model_resolve`, `before_prompt_build`, `agent_end` | Sequential (modifying) |
+| Model resolution | `before_model_resolve` | Sequential (modifying) |
+| Prompt assembly | `before_prompt_build`, `before_agent_start` | Sequential (modifying, memory-plugin only) |
 | LLM I/O | `llm_input`, `llm_output` | Parallel (observing) |
 | Tool calls | `before_tool_call`, `after_tool_call`, `tool_result_persist` | Sequential / **Sync** |
-| Messages | `message_received`, `message_sending`, `message_sent` | Sequential (modifying) |
+| Inbound messages | `inbound_claim`, `message_received`, `message_sending`, `message_sent`, `before_message_write` | Sequential / Claiming |
 | Sessions | `session_start`, `session_end`, `before_reset` | Parallel |
-| Sub-agents | `subagent_spawning`, `subagent_spawned`, `subagent_ended` | Sequential |
+| Sub-agents | `subagent_spawning`, `subagent_delivery_target`, `subagent_spawned`, `subagent_ended` | Sequential |
+| Compaction | `before_compaction`, `after_compaction` | Sequential |
 | Gateway | `gateway_start`, `gateway_stop` | Parallel |
 
-**Key design:** `tool_result_persist` and `before_message_write` are **synchronous-only** — returning a Promise is detected and warned. This prevents blocking the hot path.
+**Execution models:**
+- **Void hooks**: All handlers run in parallel via `Promise.all()`, errors caught and logged
+- **Modifying hooks**: Handlers run sequentially in priority order (higher first), results merged
+- **Claiming hooks**: Sequential execution until first `{ handled: true }` (e.g., `inbound_claim`)
+
+**Key design:** `tool_result_persist` and `before_message_write` are **synchronous-only** — returning a Promise is detected and warned. `before_prompt_build` is restricted to memory plugins only.
 
 See: `src/plugins/hooks.ts`, `src/plugins/types.ts`
 
@@ -269,21 +302,23 @@ Memory is stored as workspace files (MEMORY.md + memory/*.md), indexed asynchron
 **Search pipeline:**
 ```
 Query → Keyword Extraction → Parallel Search
-                                ├─ Vector Search (sqlite-vec)
-                                └─ FTS Keyword Search (BM25)
+                                ├─ Vector Search (sqlite-vec, quantized)
+                                └─ FTS Keyword Search (SQLite FTS5, BM25)
                                          │
                                          ▼
                               Hybrid Merge (weighted)
-                                ├─ Vector weight
-                                ├─ Text weight
-                                ├─ MMR diversity
-                                └─ Temporal decay (half-life)
+                                ├─ Vector weight × vectorScore
+                                ├─ Text weight × textScore (BM25 normalized)
+                                ├─ MMR diversity (λ=0.7)
+                                └─ Temporal decay (exponential, 30-day half-life)
                                          │
                                          ▼
                               Score threshold → Top K results
 ```
 
-See: `src/memory/manager.ts`
+**Pluggable memory system prompt section:** Memory plugins register a `MemoryPromptSectionBuilder` (exclusive slot — only one active). The core memory plugin (`extensions/memory-core`) registers `memory_search` and `memory_get` tools and provides prompt guidance for when to recall memories.
+
+See: `src/memory/manager.ts`, `src/memory/hybrid.ts`, `src/memory/prompt-section.ts`
 
 ### 3.8 Concurrency Lanes
 
@@ -295,9 +330,37 @@ Session Lane (per-session serialization)
        └─ Actual execution
 ```
 
-This ensures: (a) a session can't process two messages concurrently, and (b) global resources (like auth profile rotation) are safely shared.
+**Lane resolution details:**
+- Session lanes prefix with `"session:"` for per-session isolation
+- Global lanes avoid the cron lane (prevents deadlock when cron spawns agents)
+- Subagent steer/kill operations use `AGENT_LANE_SUBAGENT` to avoid blocking the parent session lane
+- Nested agents don't inherit the cron lane
 
-See: `src/agents/pi-embedded-runner/lanes.ts`
+See: `src/agents/pi-embedded-runner/lanes.ts`, `src/agents/lanes.ts`
+
+### 3.9 Pluggable Context Engine
+
+The context engine is a pluggable abstraction for custom compaction and context assembly strategies.
+
+**Interface:**
+```typescript
+ContextEngine = {
+  bootstrap()                  // Initialize engine state for a session
+  maintain()                   // Run transcript maintenance
+  ingest(message)              // Ingest a single message
+  ingestBatch(messages)        // Batch ingest
+  afterTurn()                  // Post-turn lifecycle work
+  assemble(tokenBudget)        // Assemble model context under budget
+  compact(params)              // Compact context to reduce tokens
+  prepareSubagentSpawn()       // Prepare subagent state
+  onSubagentEnded()            // Handle subagent lifecycle end
+  dispose()                    // Cleanup resources
+}
+```
+
+**Registry:** Engines register via `registerContextEngine(id, factory, owner)`. The default `LegacyContextEngine` wraps existing compaction behavior. Context engines receive a `runtimeContext` with `rewriteTranscriptEntries()` for safe branch-and-reappend rewrites.
+
+See: `src/context-engine/types.ts`, `src/context-engine/registry.ts`, `src/context-engine/legacy.ts`
 
 ---
 
@@ -358,7 +421,9 @@ cut   → maxPositional: 0, specific flag allowlist only
 
 **Blocked universally:** path-like tokens (`/`, `~`, `../`), glob patterns (`*`, `?`, `[]`), shell metacharacters.
 
-See: `src/infra/exec-safe-bin-policy.ts`
+**GNU long-flag abbreviation resolution:** Profiles include a `longFlagPrefixMap` for resolving abbreviated flags (e.g., `--recur` → `--recursive`). Validation halts on first violation.
+
+See: `src/infra/exec-safe-bin-policy.ts`, `src/infra/exec-safe-bin-policy-profiles.ts`
 
 ---
 
@@ -370,7 +435,7 @@ See: `src/infra/exec-safe-bin-policy.ts`
 ~/.openclaw/openclaw.json (primary, JSON5)
   │
   ├─ gateway.*          → Port, bind, auth, TLS, control UI
-  ├─ agents.defaults.*  → Default model, thinking, memory
+  ├─ agents.defaults.*  → Default model, thinking, memory, compaction
   ├─ agents.list[]*     → Per-agent: workspace, model, tools, sandbox
   ├─ channels.*         → Per-channel: tokens, routing, DM policy
   ├─ providers.models[] → LLM provider configs
@@ -388,7 +453,23 @@ agents.defaults (base)
             └─ Runtime overrides (CLI flags, env vars)
 ```
 
-### 5.3 Hot Reload
+### 5.3 Compaction Configuration
+
+Rich compaction config controls the context management strategy:
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `mode` | `"default"` | `"default"` or `"safeguard"` (conservative with overflow recovery) |
+| `identifierPolicy` | `"strict"` | `"strict"`, `"off"`, or `"custom"` — controls identifier preservation |
+| `maxHistoryShare` | 0.5 | Max % of context for history (0.1–0.9) |
+| `recentTurnsPreserve` | — | Keep N recent turns verbatim during compaction |
+| `qualityGuard.maxRetries` | 1 | Max regeneration attempts for quality audit |
+| `memoryFlush.enabled` | true | Pre-compaction agentic memory flush |
+| `postCompactionSections` | `["Session Startup", "Red Lines"]` | H2/H3 sections to re-inject after compaction |
+| `timeoutSeconds` | 900 | Safety timeout for compaction (15 minutes) |
+| `model` | — | Override model for compaction summarization |
+
+### 5.4 Hot Reload
 
 Config is file-watched with atomic updates:
 1. Detect file change
@@ -413,44 +494,35 @@ A single plugin can register any combination of:
 | **HTTP routes** | `api.registerHttpRoute({path, handler})` | Webhook endpoints |
 | **Channels** | `api.registerChannel(plugin)` | New messaging channels |
 | **Providers** | `api.registerProvider(provider)` | Custom LLM backends |
+| **Speech providers** | `api.registerSpeechProvider(provider)` | TTS/STT backends |
+| **Web search providers** | `api.registerWebSearchProvider(provider)` | Custom search backends |
+| **Image generation** | `api.registerImageGenerationProvider(provider)` | Image gen backends |
+| **Media understanding** | `api.registerMediaUnderstandingProvider(provider)` | Vision/audio analysis |
 | **CLI commands** | `api.registerCommand(def)` | Custom CLI subcommands |
 | **Services** | `api.registerService(service)` | Long-lived background services |
 | **Gateway methods** | `api.registerGatewayMethod(name, handler)` | Custom RPC methods |
+| **Memory prompt** | `api.registerMemoryPromptSection(builder)` | Custom memory prompt (exclusive slot) |
+| **Diagnostics** | `api.registerDiagnostic(diagnostic)` | Health check plugins |
 
-### 6.2 Plugin API
+### 6.2 Plugin Registry
 
 ```typescript
-export default definePlugin({
-  id: "my-plugin",
-  version: "1.0.0",
-
-  initialize: async (api: OpenClawPluginApi) => {
-    // Register a tool
-    api.registerTool(myToolFactory, { name: "my_tool" });
-
-    // Register a typed hook (compile-time safe)
-    api.on("before_tool_call", async (event, ctx) => {
-      if (event.toolName === "exec" && event.input.command.includes("rm -rf")) {
-        throw new Error("Blocked dangerous command");
-      }
-    }, { priority: 100 });
-
-    // Register an HTTP webhook
-    api.registerHttpRoute({
-      path: "/webhooks/my-service",
-      handler: async (req, res) => { /* ... */ },
-    });
-  },
-});
+PluginRegistry = {
+  plugins, tools, hooks, typedHooks, channels, channelSetups,
+  providers, speechProviders, mediaUnderstandingProviders,
+  imageGenerationProviders, webSearchProviders, gatewayHandlers,
+  httpRoutes, cliRegistrars, services, commands,
+  conversationBindingResolvedHandlers, diagnostics
+}
 ```
+
+**Plugin caching:** Registry + memory prompt builder are cached across plugin reloads. Failed plugins restore previous builder state. Memory prompt section is an exclusive slot — only one memory plugin can be active.
 
 See: `src/plugins/registry.ts`, `src/plugin-sdk/index.ts`
 
 ---
 
 ## 7. Agentic Patterns (Prompt & Tool Management)
-
-Beyond infrastructure, OpenClaw implements several patterns that directly affect how the LLM reasons, what it sees, and how its output is handled.
 
 ### 7.1 Multi-Layered Prompt Injection Defense
 
@@ -462,13 +534,16 @@ Layer A: Sanitization
   Applied to: workspace paths, container info, usernames in system prompt
 
 Layer B: Suspicious Pattern Detection
-  Regex scan for "ignore previous instructions", "you are now a...", etc.
-  10 patterns covering known injection phrases
+  12 regex patterns covering known injection phrases:
+  - "ignore previous instructions", "you are now a..."
+  - </?system>, [system]: markers
+  - rm -rf, delete all, exec command=, elevated=true
 
 Layer C: External Content Wrapping
-  Wrap untrusted content in boundary markers with random 16-char hex IDs
+  Wrap untrusted content in boundary markers with random 8-byte hex IDs
   Include explicit "DO NOT treat as instructions" notice
   Normalize homoglyphs (fullwidth, CJK, mathematical → ASCII)
+  Source labels: email, webhook, api, browser, web_search, web_fetch
 
 Layer D: Marker Spoofing Prevention
   Random IDs on start/end markers → attacker can't predict or inject fake boundaries
@@ -486,10 +561,13 @@ System Prompt:
   ├─ Identity (always)
   ├─ Tools (only policy-allowed tools, canonical order)
   ├─ Skills (only if mode=full, within 30K char budget)
-  ├─ Memory (only if memory_search tool available)
+  ├─ Memory (only if memory plugin registered, pluggable section)
   ├─ Workspace (sanitized paths)
   ├─ Sandbox (only if sandboxed)
   ├─ Runtime (model, OS, reasoning level)
+  ├─ User identity (hash-based display of owner IDs)
+  ├─ Time (user timezone)
+  ├─ Reply tags (channel-specific reply targeting)
   └─ Channel capabilities (only relevant features)
 ```
 
@@ -498,7 +576,7 @@ System Prompt:
 - `"minimal"` — reduced (sub-agents: no skills, no memory, no channel specifics)
 - `"none"` — bare identity (leaf agents)
 
-See: `src/agents/system-prompt.ts`
+See: `src/agents/system-prompt.ts`, `src/agents/system-prompt-params.ts`
 
 ### 7.3 Skill Discovery & Token Budget
 
@@ -522,8 +600,9 @@ See: `src/agents/skills/workspace.ts`
 - Plugin tools sorted alphabetically after core tools
 - Only tools that passed the 7-layer policy pipeline are shown
 - Descriptions extracted at runtime from `tool.description` — stays in sync with actual capabilities
+- ~26 core tools organized into 11 groups (`group:openclaw`, `group:fs`, `group:runtime`, `group:web`, etc.)
 
-See: `src/agents/tool-summaries.ts`, `src/agents/system-prompt.ts`
+See: `src/agents/tool-summaries.ts`, `src/agents/tool-catalog.ts`
 
 ### 7.5 Thinking Block Stripping
 
@@ -531,20 +610,24 @@ Extended thinking blocks (Claude `thinking` type) are stripped from message hist
 
 Edge case: if ALL blocks in an assistant message are thinking-only, the message is preserved with an empty text block — don't break alternating user/assistant ordering.
 
-Multi-level config: `off | minimal | low | medium | high | xhigh`, resolved per-model capability.
+Multi-level config: `off | minimal | low | medium | high | xhigh`, resolved per-model capability with automatic fallback (e.g., `xhigh` + no-xhigh model → `high`).
 
 See: `src/agents/pi-embedded-runner/thinking.ts`
 
-### 7.6 Tool Result Details Stripping
+### 7.6 Tool Result Sanitization & Smart Truncation
 
-Tool results carry a `details` field for UI display and audit — but it's stripped before the LLM sees the message. This prevents:
-- Token waste from verbose metadata
-- Injection from untrusted external API responses
-- Context pollution from debug output
+Tool results carry a `details` field for UI display and audit — but it's stripped before the LLM sees the message.
 
-Additionally, shell command results get **semantic summarization**: `git status` → "check git status", `npm install` → "install dependencies". The LLM understands the action without reading verbose terminal output.
+**Smart truncation strategy:**
+- Detects if tail contains important content (error messages, exceptions, JSON closing braces)
+- If tail is important: uses head+tail strategy (head gets normal budget, tail gets min(30%, 4K))
+- Otherwise: preserves beginning with best-effort newline alignment
+- Per-block budget distributed proportionally among text blocks in a result
+- Hard limits: 400KB absolute max, 30% of context window per result, minimum 2K chars always kept
 
-See: `src/agents/tool-display-common.ts`, `src/agents/compaction.ts`
+Additionally, shell command results get **semantic summarization**: `git status` → "check git status", `npm install` → "install dependencies".
+
+See: `src/agents/tool-display-common.ts`, `src/agents/pi-embedded-runner/tool-result-truncation.ts`
 
 ### 7.7 Response Output Directives
 
@@ -579,44 +662,57 @@ See: `src/auto-reply/reply/untrusted-context.ts`
 
 ---
 
-## 8. Seven-Dimension Agent Analysis
+## 8. Eight-Dimension Agent Analysis
 
-A structured analysis of OpenClaw's agent architecture across seven critical dimensions. Each subsection answers specific design questions relevant to anyone building production agent systems.
+A structured analysis of OpenClaw's agent architecture across eight critical dimensions. Each subsection answers specific design questions relevant to anyone building production agent systems.
 
 ### 8.1 Architecture & Agent Topology
 
-**Architecture type: Orchestrator + Spawnable Subagents**
+**Architecture type: Orchestrator + Spawnable Sub-agents + ACP Sessions**
 
-OpenClaw is NOT a swarm, NOT a fixed specialist pool, and NOT a multi-agent peer network. It uses a single primary agent per session with the ability to spawn subagents on demand.
+OpenClaw uses a single primary agent per session with two spawn models: embedded sub-agents (hierarchical, in-process) and ACP sessions (external-process, protocol-based).
 
 ```
-┌──────────────────────────────────────────────┐
-│  Gateway (singleton process)                  │
-│                                               │
-│  ┌────────────────────────────────────────┐   │
-│  │  Agent Run (per-session)                │   │
-│  │  ├─ runEmbeddedPiAgent() ← main entry  │   │
-│  │  │                                      │   │
-│  │  ├─ Sub-agent (depth 1)                 │   │
-│  │  │   └─ Sub-agent (depth 2)             │   │
-│  │  │       └─ Leaf (depth = max, no spawn)│   │
-│  │  │                                      │   │
-│  │  └─ Sub-agent registry (in-memory)      │   │
-│  └────────────────────────────────────────┘   │
-│                                               │
-│  ┌────────────────────────────────────────┐   │
-│  │  Another Agent Run (different session)   │   │
-│  └────────────────────────────────────────┘   │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  Gateway (singleton process)                      │
+│                                                   │
+│  ┌────────────────────────────────────────────┐   │
+│  │  Agent Run (per-session)                    │   │
+│  │  ├─ runEmbeddedPiAgent() ← main entry      │   │
+│  │  │                                          │   │
+│  │  ├─ Sub-agent (depth 1, role=orchestrator)  │   │
+│  │  │   └─ Sub-agent (depth 2, role=leaf)      │   │
+│  │  │       └─ (no spawn capability)           │   │
+│  │  │                                          │   │
+│  │  ├─ ACP Session (external, oneshot/persist) │   │
+│  │  │   └─ Thread-bound (optional)             │   │
+│  │  │                                          │   │
+│  │  └─ Sub-agent registry (in-memory + disk)   │   │
+│  └────────────────────────────────────────────┘   │
+│                                                   │
+│  ┌────────────────────────────────────────────┐   │
+│  │  Another Agent Run (different session)       │   │
+│  └────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────┘
 ```
 
 **Agent differentiation:** Agents are differentiated by configuration role (different system prompts, tool policies, workspaces), NOT by class or code. Every agent runs through the same `runEmbeddedPiAgent()` function with different config params.
 
 **Inter-agent communication:**
 - **Primary mechanism:** `callGateway()` RPC — agents communicate via the gateway's internal method registry, not direct message passing
-- **Subagent spawn:** `sessions_spawn` tool creates a child agent with its own session key (`agent:{id}:subagent:{uuid}`)
-- **Message steering:** `queueEmbeddedPiMessage()` injects messages into an active agent's run in real-time (e.g., new incoming messages while the agent is processing)
+- **Subagent spawn:** `sessions_spawn` tool creates a child agent with its own session key
+- **ACP spawn:** `acp_spawn` creates an external-process agent with optional stream relay
+- **Message steering:** `queueEmbeddedPiMessage()` injects messages into an active agent's run
+- **Announce/completion:** Push-based mechanism for subagent results (no polling)
 - **No shared message bus:** agents don't broadcast; communication is point-to-point via gateway
+
+**Subagent registry (NEW):**
+- In-memory `Map<string, SubagentRunRecord>` + disk persistence at `subagents/runs.json` (versioned V2 format)
+- Tracks 30+ fields per run: identity, lifecycle, announce state, cleanup state, attachments
+- Sweeper loop monitors announce timeouts and cleanup
+- Max announce retry: 3 attempts with exponential backoff (1s → 2s → 4s → 8s)
+- Announce expiry: 5 min (non-completion), 30 min (completion flow)
+- Frozen result capture: latest assistant text (up to 100KB) preserved for delayed delivery
 
 **Routing:** Multi-tier priority routing resolves which agent handles a message:
 1. Direct assignment (explicit agent ID in route config)
@@ -624,7 +720,7 @@ OpenClaw is NOT a swarm, NOT a fixed specialist pool, and NOT a multi-agent peer
 3. Account-level default agent
 4. System default
 
-See: `src/agents/pi-embedded-runner/run.ts`, `src/agents/subagent-spawn.ts`, `src/routing/resolve-route.ts`
+See: `src/agents/pi-embedded-runner/run.ts`, `src/agents/subagent-spawn.ts`, `src/agents/subagent-registry.ts`, `src/agents/acp-spawn.ts`
 
 ### 8.2 Context Management
 
@@ -636,8 +732,10 @@ See: `src/agents/pi-embedded-runner/run.ts`, `src/agents/subagent-spawn.ts`, `sr
 | Context share per tool result | 30% of context max | No single tool result can take more than 30% of window |
 | Headroom ratio | 0.75 | Reserve 25% of context for model output and new messages |
 | Single tool share | 0.50 | Within headroom, a single tool result capped at 50% |
+| Context window hard min | 16,000 tokens | Below this, block agent start |
+| Context window warn | 32,000 tokens | Emit warning below this |
 
-**5-tier error recovery (extended from the 3-tier compaction):**
+**5-tier error recovery:**
 
 ```
 Tier 1: In-Attempt Auto-Compaction
@@ -650,7 +748,8 @@ Tier 2: Explicit Overflow Compaction
 
 Tier 3: Tool Result Truncation
   └─ Identify oversized tool results
-  └─ Truncate to fit within context share limits
+  └─ Smart head+tail truncation strategy
+  └─ Min 2K chars always preserved
 
 Tier 4: Thinking Level Downgrade
   └─ Reduce extended thinking budget
@@ -661,13 +760,29 @@ Tier 5: Auth Profile Rotation
   └─ May have a larger context window
 ```
 
-**History truncation:** Per-session configurable via `sessionKey` config. Messages beyond the limit are dropped from the front (oldest first). No explicit summarization-on-truncation — the compaction layer handles that separately.
+**Compaction algorithm (staged summarization):**
+1. Resolve context window (model → config → default)
+2. Compute adaptive chunk ratio based on message sizes (0.15–0.40 of context)
+3. Prune history chunks until `maxHistoryShare` (default 0.50) budget met
+4. Repair orphaned tool_use/tool_result pairings
+5. Summarize dropped messages in stages (split into N parts, summarize each, merge)
+6. Apply identifier preservation instructions (UUIDs, hashes, IDs, tokens, URLs)
+7. Optional: pre-compaction memory flush (agentic turn to store notes)
+8. Optional: re-inject post-compaction sections ("Session Startup", "Red Lines")
+9. Safety timeout: 15 minutes default with abort signal
+
+**Bootstrap context system:**
+- `BootstrapContextMode`: `"full"` or `"lightweight"` (heartbeat/cron runs)
+- Per-file and total char limits for bootstrap files (AGENTS.md, etc.)
+- Budget analysis detects near-limit files (>85% of limit) and warns
+- Dedup via stable truncation signatures (warns once per unique signature)
+- In-memory cache per sessionKey
+
+**History truncation:** Per-session configurable. Messages beyond the limit are dropped from the front (oldest first). No explicit summarization-on-truncation — the compaction layer handles that separately.
 
 **Context shielding:** Subagents get completely fresh context. They don't inherit the parent's message history. Inter-agent data transfer happens through the tool result (parent sees subagent output as a `ToolMessage`), not through shared context.
 
-**What's NOT present:** No sliding-window summarization, no RAG over conversation history, no checkpoint-and-restore for mid-run context. The approach is: budget hard, compact aggressively, truncate tool results, and shield subagents from parent context.
-
-See: `src/agents/pi-embedded-runner/tool-result-truncation.ts`, `src/agents/compaction.ts`, `src/agents/pi-embedded-runner/history.ts`
+See: `src/agents/compaction.ts`, `src/agents/context-window-guard.ts`, `src/agents/bootstrap-budget.ts`, `src/context-engine/types.ts`
 
 ### 8.3 Planning & Execution
 
@@ -685,16 +800,6 @@ OpenClaw does NOT have:
 **Why this works for OpenClaw:** The platform handles diverse, often short-lived tasks from messaging channels (Slack, Discord, Telegram). Most interactions are conversational — a user asks a question, the agent responds, maybe calling 1-3 tools. For these cases, a formal planning phase would add latency without benefit.
 
 **Tradeoff:** This approach relies heavily on the LLM's ability to self-organize multi-step tasks. For complex, multi-step research or coding tasks, the lack of an explicit plan means the agent can lose coherence over long runs (~50+ tool calls). The mitigation is the dual-loop retry mechanism (§8.6) and thinking block support (§8.4), not a plan-and-execute architecture.
-
-**Comparison with plan-based agents:**
-```
-Plan-and-Execute Agent:           OpenClaw:
-  Plan → [Step1, Step2, Step3]      System prompt → LLM decides
-  Execute Step1                     LLM calls tools as needed
-  Check plan progress               LLM self-monitors via thinking
-  Replan if needed                  No replanning — retry on error
-  Execute Step2...                  Continue until stop_reason != tool_use
-```
 
 ### 8.4 Thinking & Reasoning
 
@@ -724,8 +829,9 @@ Requested: "medium" + Model: no-thinking → Resolved: "off"
 3. Before re-sending history, all thinking blocks are stripped from assistant messages
 4. If stripping leaves an empty assistant message, an empty text block preserves message alternation
 5. Think level is communicated in the system prompt: `Reasoning: {level}`
+6. On context overflow, thinking level can be downgraded as a recovery strategy
 
-**No think tool:** OpenClaw does not implement a "think tool" (a tool that returns its input as a reflection checkpoint). All reasoning happens natively within the model's extended thinking capability. The tradeoff: native thinking is more natural and doesn't consume a tool call, but it's stripped from history and not visible in the message transcript.
+**No think tool:** OpenClaw does not implement a "think tool." All reasoning happens natively within the model's extended thinking capability.
 
 See: `src/agents/pi-embedded-runner/thinking.ts`, `src/auto-reply/thinking.ts`
 
@@ -735,7 +841,7 @@ See: `src/agents/pi-embedded-runner/thinking.ts`, `src/auto-reply/thinking.ts`
 
 **Tool execution: sequential within a turn.** When the LLM returns multiple tool calls in a single response, they are executed sequentially (not in parallel). Each tool result is appended to the message history before the next tool executes.
 
-**Tool interface:** All tools implement `AgentTool<P, D>` from `pi-agent-core`:
+**Tool interface:** All tools implement `AgentTool<P, D>`:
 ```typescript
 interface AgentTool<P, D> {
   name: string;
@@ -750,24 +856,33 @@ interface AgentTool<P, D> {
 
 **4-layer tool loop detection:**
 
-| Detector | What it catches | Mechanism |
-|----------|----------------|-----------|
-| `generic_repeat` | Agent calling the same tool with same args repeatedly | Track last N calls, compare args |
-| `known_poll_no_progress` | Polling patterns (e.g., repeated `exec` checking status) | Detect poll-like patterns without state change |
-| `global_circuit_breaker` | Total tool calls exceeding threshold | Hard cap on calls per run |
-| `ping_pong` | Two tools alternating back and forth | Detect A→B→A→B pattern |
+| Detector | What it catches | Warning | Critical | Mechanism |
+|----------|----------------|---------|----------|-----------|
+| `global_circuit_breaker` | Same tool+params repeated | — | ≥30 | Track in 30-entry sliding window |
+| `known_poll_no_progress` | Polling patterns without state change | ≥10 | ≥20 | Detect poll/log actions with stable outcomes |
+| `ping_pong` | Two tools alternating back and forth | ≥10 | ≥20 | Detect A→B→A→B pattern with stable outcomes |
+| `generic_repeat` | Any tool called with identical args | ≥10 | — | Compare args hashes in sliding window |
 
-When a loop is detected, the system injects a corrective message into the conversation to nudge the agent out of the loop, rather than terminating the run.
+**Hashing:** SHA256 of tool name + deterministic JSON of params. Outcome hashing extracts status/exitCode/text for process tools.
+
+When a loop is detected, the system injects a corrective message into the conversation to nudge the agent out of the loop, rather than terminating the run. Warning every 10 calls (bucketed to avoid flooding).
+
+**Tool mutation tracking:**
+- Mutating tools: write, edit, exec, process, message, cron, gateway, canvas, etc.
+- `buildToolActionFingerprint()` creates stable fingerprints for mutating operations
+- Errors on mutating ops don't clear until the same action succeeds (prevents false recovery)
+- Non-mutating tools clear errors immediately on success
 
 **Meta-tools (tools that manage other tools/agents):**
 - `sessions_spawn` — spawn a subagent
 - `sessions_send` — send a message to an active session
 - `sessions_list` / `sessions_history` — query session state
+- `sessions_yield` — yield execution back to parent
 - `gateway` — call gateway RPC methods
 
 **Plugin tool factory:** Plugins create tools via factory functions registered at startup. Tool instances are created per-run with access to the current session context.
 
-See: `src/agents/tool-loop-detection.ts`, `src/agents/pi-tools.before-tool-call.ts`, `src/agents/pi-tools.policy.ts`
+See: `src/agents/tool-loop-detection.ts`, `src/agents/tool-mutation.ts`, `src/agents/pi-tools.ts`, `src/agents/tool-policy-pipeline.ts`
 
 ### 8.6 Flow Control & Error Handling
 
@@ -775,17 +890,18 @@ See: `src/agents/tool-loop-detection.ts`, `src/agents/pi-tools.before-tool-call.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  OUTER LOOP (file: run.ts, ~1135 lines)                 │
+│  OUTER LOOP (file: run.ts, ~1600 lines)                  │
 │  Purpose: retry, failover, recovery                     │
 │  Controls: auth profile rotation, compaction triggers,  │
-│           overflow recovery, max iteration tracking      │
+│           overflow recovery, max iteration tracking,     │
+│           model fallback chain                           │
 │                                                         │
 │  ┌───────────────────────────────────────────────────┐  │
-│  │  INNER LOOP (file: attempt.ts, ~1369 lines)       │  │
+│  │  INNER LOOP (file: attempt.ts, ~2900 lines)       │  │
 │  │  Purpose: single inference attempt                 │  │
 │  │  Controls: SDK agent invocation, streaming,        │  │
 │  │           tool call execution, message building,   │  │
-│  │           tool loop detection                      │  │
+│  │           tool loop detection, block chunking      │  │
 │  │                                                    │  │
 │  │  SDK Tool Loop:                                    │  │
 │  │    LLM call → parse response → tool calls?         │  │
@@ -794,53 +910,142 @@ See: `src/agents/tool-loop-detection.ts`, `src/agents/pi-tools.before-tool-call.
 │  └───────────────────────────────────────────────────┘  │
 │                                                         │
 │  On failure → classify error → recovery strategy:       │
-│    auth error    → rotate profile, retry                │
-│    overflow      → compact + retry                      │
-│    timeout       → mark profile, rotate, retry          │
-│    tool loop     → inject corrective message            │
+│    auth error    → refresh token, rotate profile        │
+│    rate_limit    → backoff (250ms→1.5s, 2x), rotate    │
+│    overloaded    → backoff, rotate                      │
+│    billing       → mark profile, rotate                 │
+│    timeout       → mark (no cooldown), rotate           │
+│    format        → retry with different thinking level  │
+│    overflow      → compact + truncate + retry           │
 │    unknown       → increment counter, retry or fail     │
+│                                                         │
+│  Model fallback: FailoverError → next candidate in chain│
 └─────────────────────────────────────────────────────────┘
 ```
 
-**Max iterations:** `24 base + 8 per auth profile` (min 32, max ~160 depending on configured profiles). This is NOT per-attempt — it's the total iteration budget across all retries.
+**Max iterations:** `24 base + 8 per auth profile` (min 32, max 160 depending on configured profiles). This is the total iteration budget across all retries.
+
+**Error classification (FailoverError):**
+
+| HTTP Status | Reason | Cooldown | Recovery |
+|-------------|--------|----------|----------|
+| 401/403 | `auth` | Yes (120s+ TTL) | Refresh token → rotate profile |
+| 402 | `billing` | Yes (custom) | Rotate profile |
+| 429 | `rate_limit` | Yes (30s min) | Backoff + rotate |
+| 503 | `overloaded` | Yes | Backoff + rotate |
+| 408/timeout | `timeout` | No | Rotate (no cooldown) |
+| — | `format` | No | Retry with fallback thinking level |
+
+**Probing cooldowned profiles:** Allows transient probes of cooldowned profiles when `allowTransientCooldownProbe=true`, throttled to 1 probe per 30 seconds.
+
+**Runtime auth refresh:** Scheduled 5 minutes before expiry, retries every 60s on failure, minimum 5s between refreshes. Plugins can exchange credentials via `prepareProviderRuntimeAuth()`.
+
+**Model fallback chain:** Primary model → fallback chain from config → filter by allowlist. Each candidate tried in order; `FailoverError` continues to next candidate.
 
 **Done detection:** The SDK's `stop_reason` field drives the control flow:
 - `stop_reason === "tool_use"` → more tool calls to process, continue inner loop
 - `stop_reason === "end_turn"` or other → agent is done, extract final response
 - No explicit "done" tool — done is a model signal, not a tool call
 
-**HITL (Human-in-the-Loop):** Implemented as a **tool-level gate**, not a whole-run approval:
-- Only elevated bash commands trigger HITL (approval required before execution)
-- The agent run continues autonomously between approval points
-- No "approve the plan" or "approve the final output" gates
+**HITL (Human-in-the-Loop):** Implemented as a **tool-level gate** with two-phase registration:
+1. `registerExecApprovalRequest()` — registers request server-side, returns ID + expiry
+2. `waitForExecApprovalDecision()` — blocks until user approves/rejects
+- Race-safe: ID registered before returning "approval-pending" status
 - Approval is binary: allow or deny the specific tool execution
+- Async completion followup with idempotency key after approved command finishes
+
+**Block chunking for long responses:**
+- Configurable min/max chars, break preference (paragraph/newline/sentence)
+- Respects Markdown fence boundaries — closes and reopens fenced code blocks at split points
+- Flushes on paragraph breaks when min chars satisfied
 
 **Token tracking:** Two distinct counters:
 - `accumulated` — total tokens used across all attempts in this run
 - `lastCall` — tokens from the most recent LLM call only
 
-The `lastCall` snapshot prevents inflating context estimates. If you only tracked accumulated usage, you'd overcount context size by N × context_window for N attempts.
+See: `src/agents/pi-embedded-runner/run.ts`, `src/agents/pi-embedded-runner/run/attempt.ts`, `src/agents/failover-error.ts`, `src/agents/model-fallback.ts`
 
-See: `src/agents/pi-embedded-runner/run.ts`, `src/agents/pi-embedded-runner/run/attempt.ts`
+### 8.7 User Interruption & Interference
 
-### 8.7 State & Persistence
+**Abort/cancellation mechanism:**
+- `AbortSignal` wrapping: tools receive combined abort signals from multiple sources via `combineAbortSignals()` (uses `AbortSignal.any()`)
+- Global registry: `ACTIVE_EMBEDDED_RUNS` (Map) tracks active sessions by sessionId
+- Multi-mode abort: abort single run, abort only compacting runs, or abort all active runs
+- Permissive abort detection: catches abort signals from various sources via error name/message checking
 
-**Session state:** 30+ field `SessionEntry` schema tracks everything about a session:
+**Message injection (steering):**
+- `queueEmbeddedPiMessage(sessionId, text)` injects messages into active agent runs
+- Validates: run is active, streaming, not compacting
+- Used for new incoming messages while agent is processing
+
+**Subagent control:**
+- **Kill:** abort streaming run → clear session queues → mark terminated → cascade kill descendants (with cycle detection)
+- **Steer:** rate-limited (2s between steer messages) → abort current run → wait 5s settle → inject new message → replace run record in registry
+- **Send message:** inject without abort, wait 30s for response
+- **Ownership validation:** only the controller that spawned a run can control it
+
+**Orphan recovery:**
+- After SIGUSR1 gateway reload, scans for aborted subagent runs
+- Builds resume message with original task + last human message
+- Retries with exponential backoff (5s initial, 3 max retries, 2x multiplier)
+
+**Session write locking:**
+- PID + starttime lock files with staleness detection (dead PID, recycled PID, old age)
+- Reentrant lock support (increments count)
+- Timeout-based retry loop (10s default, exponential backoff 50ms→1000ms)
+- Signal handlers (SIGINT, SIGTERM, SIGQUIT, SIGABRT) trigger synchronous cleanup
+- Watchdog timer checks for expired locks every 60s, force-releases after 5 minutes
+
+**Session transcript repair:**
+- Line-by-line JSON validation for corrupted JSONL files
+- Tool call input repair: drops missing IDs/names, redacts attachment content
+- Tool use result pairing: moves orphans, inserts synthetic errors for missing IDs, drops duplicates
+- Backup → clean → atomic rename strategy
+
+See: `src/agents/pi-tools.abort.ts`, `src/agents/pi-embedded-runner/runs.ts`, `src/agents/subagent-control.ts`, `src/agents/subagent-orphan-recovery.ts`, `src/agents/session-write-lock.ts`
+
+### 8.8 State & Persistence
+
+**Session state:** `SessionEntry` schema tracks 30+ fields:
 
 ```
 SessionEntry fields (key groups):
-  Identity:    sessionKey, agentId, accountId, channelId
-  Lifecycle:   startedAt, lastActiveAt, status, runCount
-  Context:     messages[], systemPrompt, model, thinkLevel
+  Identity:    sessionId, sessionKey, agentId, accountId, channelId
+  Lifecycle:   startedAt, endedAt, status (running|done|failed|killed|timeout)
+  Context:     messages[], systemPrompt, model, thinkLevel, reasoningLevel
   Concurrency: laneId, lockHolder, queueDepth
-  Metrics:     tokenUsage, toolCallCount, compactionCount
+  Metrics:     inputTokens, outputTokens, totalTokens, estimatedCostUsd, cacheRead/Write
+  Compaction:  compactionCount, contextTokens, memoryFlushAt, memoryFlushContextHash
   Config:      workspace, sandbox, authProfile, maxIterations
+  Subagent:    spawnedBy, spawnDepth, subagentRole, subagentControlScope, parentSessionKey
+  Abort:       abortedLastRun, abortCutoffMessageSid, abortCutoffTimestamp
+  Delivery:    channel, lastChannel, lastTo, lastAccountId, lastThreadId, deliveryContext
 ```
 
 **Persistence model:** JSONL transcript files, one per session. Each event (message, tool call, tool result, model response) is appended as a JSON line. This provides:
 - Append-only durability (no corruption from partial writes)
 - Full audit trail
-- Replayability (theoretically — not actively used for state recovery)
+- Replayability
+
+**Subagent registry persistence:** `subagents/runs.json` (V2 format) with full record serialization, merged with in-memory state on restore.
+
+**Session tool result guard:**
+- Tracks pending tool_use blocks awaiting tool_result
+- Normalizes tool result names, caps size (400KB)
+- Flushes or clears pending results before non-tool messages
+- Hooks: `transformMessageForPersistence()`, `beforeMessageWriteHook()`
+- Allowed tool name whitelist filtering
+
+**Active run tracking:** The system maintains a registry of currently running agent invocations via `ACTIVE_EMBEDDED_RUNS` map + `ACTIVE_EMBEDDED_RUN_SNAPSHOTS`. This enables:
+- Message steering (injecting messages into active runs)
+- Status queries ("is this agent currently running?")
+- Graceful shutdown (wait for active runs to complete)
+- Waiter pattern: `waitForEmbeddedPiRunEnd(sessionId, timeoutMs)` for run-end notifications
+
+**Guard/flush mechanisms:**
+- `waitForIdle()` → flush or clear pending tool results (30s timeout)
+- Block reply buffer flush before compaction wait ensures responses reach channel
+- Compaction retry promises resolved in lifecycle end handler
 
 **What's NOT present:**
 - No formal checkpointing (can't "save and resume" a mid-run state)
@@ -849,19 +1054,7 @@ SessionEntry fields (key groups):
 - No cross-session state sharing (each session is isolated)
 - No real-time state replication to external stores
 
-**Lane-based concurrency:** Sessions are serialized through nested lane queues:
-```
-Session Lane (per-session: prevents concurrent processing of same session)
-  └─ Global Lane (cross-session: coordinates shared resources like auth profiles)
-       └─ Actual execution
-```
-
-**Active run tracking:** The system maintains a registry of currently running agent invocations via `activeRuns` map. This enables:
-- Message steering (injecting messages into active runs)
-- Status queries ("is this agent currently running?")
-- Graceful shutdown (wait for active runs to complete)
-
-See: `src/config/sessions/types.ts`, `src/agents/pi-embedded-runner/runs.ts`, `src/agents/pi-embedded-runner/lanes.ts`
+See: `src/config/sessions/types.ts`, `src/agents/pi-embedded-runner/runs.ts`, `src/agents/session-tool-result-guard.ts`, `src/agents/session-write-lock.ts`
 
 ---
 
@@ -870,27 +1063,35 @@ See: `src/config/sessions/types.ts`, `src/agents/pi-embedded-runner/runs.ts`, `s
 ### Infrastructure
 1. **Embedded > microservice for agent loops** — running agents in-process eliminates network overhead and simplifies tool access. Retry/failover wraps the execution, not the deployment.
 2. **Layered policies > flat allow/deny** — a 7-layer pipeline lets different stakeholders (admin, agent config, user group) independently constrain tools without conflicting.
-3. **Depth-aware sub-agents** — don't just limit recursion count; restrict *capabilities* at each depth. Leaf agents shouldn't be able to spawn more children.
-4. **3-tier context recovery** — compaction alone isn't enough. You need fallbacks: auto-compact → explicit compact → truncate oversized tool results.
-5. **Sync hooks for hot paths** — not every hook can be async. Identify your hot paths (tool result persistence, message serialization) and enforce synchronous execution.
-6. **Session lanes for concurrency** — don't rely on "it probably won't happen." Serialize per-session, coordinate globally.
-7. **Hybrid memory search** — pure vector search misses exact matches; pure keyword search misses semantics. Combine both with weighted merging and temporal decay.
-8. **Defense-in-depth for agent security** — no single layer is sufficient. Config validation, tool policies, command sandboxing, container isolation, and audit logging all serve different threat vectors.
+3. **Depth-aware sub-agents with role-based capabilities** — don't just limit recursion count; restrict *capabilities* at each depth. Leaf agents shouldn't be able to spawn more children. Track roles (main/orchestrator/leaf) and control scope (children/none).
+4. **5-tier context recovery** — compaction alone isn't enough. You need escalating fallbacks: auto-compact → explicit compact → truncate oversized tool results → downgrade thinking → rotate model.
+5. **Pluggable context engine** — abstract compaction/assembly behind an interface so custom strategies can be swapped without touching the core loop. The legacy engine preserves backward compatibility.
+6. **Sync hooks for hot paths** — not every hook can be async. Identify your hot paths (tool result persistence, message serialization) and enforce synchronous execution.
+7. **Session lanes for concurrency** — don't rely on "it probably won't happen." Serialize per-session, coordinate globally. Avoid deadlock by routing subagent/cron operations to separate lanes.
+8. **Hybrid memory search** — pure vector search misses exact matches; pure keyword search misses semantics. Combine both with weighted merging, MMR diversity, and temporal decay.
+9. **Defense-in-depth for agent security** — no single layer is sufficient. Config validation, tool policies, command sandboxing, container isolation, and audit logging all serve different threat vectors.
 
 ### Agentic
-9. **Layer prompt injection defenses** — sanitize inputs, detect suspicious patterns, wrap untrusted content in random-ID markers, normalize homoglyphs. No single layer catches everything.
-10. **Conditional prompt sections** — only include memory instructions if memory tools are available, only include skills if not a sub-agent. Match prompt content to actual capabilities.
-11. **Token-budget skill injection** — don't inline 50+ skill descriptions. Present a scannable list, let the LLM read details on-demand via a tool. Cap total chars.
-12. **Canonical tool ordering** — core tools first in fixed order, extras alphabetically. Prevents positional bias in tool selection.
-13. **Strip thinking blocks from history** — extended reasoning is useful for one pass but wastes context when re-sent. Preserve empty turns to maintain message alternation.
-14. **Separate display from LLM data** — tool results carry `details` for UI/audit but strip them before the LLM sees them. The LLM gets clean, minimal results.
-15. **Inline output directives** — let the agent express routing intent (`[[reply_to:id]]`, media, silence) in its text output instead of requiring separate tool calls.
+10. **Layer prompt injection defenses** — sanitize inputs, detect suspicious patterns (12 regexes), wrap untrusted content in random-ID markers, normalize homoglyphs. No single layer catches everything.
+11. **Conditional prompt sections** — only include memory instructions if memory tools are available, only include skills if not a sub-agent. Match prompt content to actual capabilities.
+12. **Token-budget skill injection** — don't inline 50+ skill descriptions. Present a scannable list, let the LLM read details on-demand via a tool. Cap total chars.
+13. **Canonical tool ordering** — core tools first in fixed order, extras alphabetically. Prevents positional bias in tool selection.
+14. **Strip thinking blocks from history** — extended reasoning is useful for one pass but wastes context when re-sent. Preserve empty turns to maintain message alternation.
+15. **Separate display from LLM data** — tool results carry `details` for UI/audit but strip them before the LLM sees them. Smart truncation uses head+tail strategy when tail contains errors.
+16. **Inline output directives** — let the agent express routing intent (`[[reply_to:id]]`, media, silence) in its text output instead of requiring separate tool calls.
 
-### Architecture & Flow (from 7-dimension analysis)
-16. **No-plan architecture works for conversational agents** — when most interactions are short (1-5 tool calls), a formal planning phase adds latency without benefit. Delegate planning to the LLM's reasoning via system prompt.
-17. **Dual-loop separation** — keep the retry/recovery loop (auth failover, compaction, overflow) separate from the tool-use loop (LLM call, tool execution, message building). Different concerns, different files, different responsibilities.
-18. **Done = model signal, not tool call** — use `stop_reason` from the SDK to detect completion. No "done" tool needed if your LLM reliably signals end_turn.
-19. **Tool loop detection beats hard caps** — instead of a flat max-tool-calls limit, detect specific loop patterns (repeat, poll, ping-pong, circuit breaker) and inject corrective messages. The agent self-corrects rather than being terminated.
-20. **HITL as tool-level gate** — approve individual dangerous operations (elevated bash commands), not the entire plan or final output. The agent runs autonomously between approval points.
-21. **Pure LLM tool selection scales** — with 30+ tools and 50+ skills, pure LLM selection (no planner, no rule-based router) works when backed by proper tool ordering, policy filtering, and descriptive tool schemas.
-22. **Message steering for real-time context** — injecting messages into active agent runs lets you handle new information arriving while the agent is processing, without restarting the run.
+### Architecture & Flow
+17. **No-plan architecture works for conversational agents** — when most interactions are short (1-5 tool calls), a formal planning phase adds latency without benefit. Delegate planning to the LLM's reasoning via system prompt.
+18. **Dual-loop separation** — keep the retry/recovery loop (auth failover, compaction, overflow) separate from the tool-use loop (LLM call, tool execution, message building). Different concerns, different files, different responsibilities.
+19. **Done = model signal, not tool call** — use `stop_reason` from the SDK to detect completion. No "done" tool needed if your LLM reliably signals end_turn.
+20. **Tool loop detection beats hard caps** — instead of a flat max-tool-calls limit, detect specific loop patterns (repeat, poll, ping-pong, circuit breaker) with per-pattern thresholds and inject corrective messages. The agent self-corrects rather than being terminated.
+21. **HITL as two-phase tool-level gate** — register approval requests server-side before surfacing to user (race-safe), then block until decision. Approve individual dangerous operations, not the entire plan.
+22. **Pure LLM tool selection scales** — with 26+ core tools and 50+ skills, pure LLM selection works when backed by proper tool ordering, policy filtering, and descriptive tool schemas.
+23. **Message steering for real-time context** — injecting messages into active agent runs lets you handle new information arriving while the agent is processing, without restarting the run.
+
+### Sub-agent Lifecycle
+24. **Push-based announce > polling** — sub-agents deliver results to parents via push-based announce mechanism. Explicit instruction: "do NOT call sessions_list or polling tools — wait for completion events."
+25. **Frozen result capture for reliability** — capture latest assistant text (up to 100KB) when subagent run ends. If announce delivery is delayed (restart, timeout), the frozen result survives.
+26. **Orphan recovery on restart** — after gateway reload, scan for aborted subagent runs and resume with exponential backoff. Don't lose in-flight work.
+27. **Dual spawn models for different needs** — embedded sub-agents for hierarchical control with depth restrictions; ACP sessions for external-process isolation with protocol-based communication.
+28. **Tool mutation tracking** — fingerprint mutating operations and clear errors only when the same action succeeds. Prevents false recovery from unrelated tool successes.

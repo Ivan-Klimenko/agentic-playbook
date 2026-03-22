@@ -61,14 +61,21 @@ Don't use a flat allow/deny list for tool access. Use a composable pipeline wher
 
 ## 3. Sub-Agent Depth-Aware Tool Restrictions
 
-Don't just limit recursion depth — restrict *what sub-agents can do* based on their depth in the spawn tree.
+Don't just limit recursion depth — restrict *what sub-agents can do* based on their depth in the spawn tree, using role-based capabilities.
 
-**Depth model:**
+**Depth model with roles:**
 ```
-Main Agent (depth 0) → All tools available
-  └─ Orchestrator Sub-Agent (depth 1) → Deny: gateway, cron, memory
-       └─ Leaf Sub-Agent (depth 2, max) → Also deny: spawn, session mgmt
+Main Agent (depth 0, role=main) → All tools, can spawn, can control children
+  └─ Orchestrator (depth 1, role=orchestrator) → Deny: gateway, cron, memory; can spawn + control
+       └─ Leaf (depth 2, role=leaf) → Also deny: spawn, session mgmt; no control scope
 ```
+
+**Role resolution:** `resolveSubagentRoleForDepth()` maps depth to one of three roles:
+- `main` (depth 0): full capabilities
+- `orchestrator` (0 < depth < maxSpawnDepth): can spawn, can control children
+- `leaf` (depth ≥ maxSpawnDepth): cannot spawn, cannot control
+
+**Control scope:** Each role has a control scope (`"children"` or `"none"`) that determines whether the agent can kill/steer/message its sub-agents. Only the controller that spawned a run can control it.
 
 **Rules:**
 - **Always denied** for any sub-agent: system admin tools, memory access, direct session sends
@@ -76,41 +83,56 @@ Main Agent (depth 0) → All tools available
 - Explicit `alsoAllow` in config can override deny rules
 - Cross-agent spawning requires explicit `allowAgents` allowlist
 - `maxChildrenPerAgent` limits concurrent children per session
+- Capabilities are persisted in session store and survive gateway restarts
 
 **Why it matters:** Without depth-aware restrictions, a sub-agent can spawn unlimited children, each with full capabilities. This creates recursion bombs and privilege escalation paths.
 
-> See: [code_snippets/subagent_depth_policy.ts](./code_snippets/subagent_depth_policy.ts)
+> See: [code_snippets/openclaw/subagent_depth_policy.ts](./code_snippets/openclaw/subagent_depth_policy.ts)
 
 ---
 
-## 4. 3-Tier Context Window Recovery
+## 4. 5-Tier Context Window Recovery
 
 Context overflow is inevitable with long-running agents. Don't just fail — implement escalating recovery:
 
 ```
 Tier 1: In-Attempt Auto-Compaction
   The agent SDK detects overflow during tool loop and compacts automatically.
-  If overflow persists after compaction → retry (up to MAX attempts).
+  If overflow persists after compaction → retry (up to 3 attempts).
 
 Tier 2: Explicit Overflow Compaction
-  Gateway triggers external compaction (summarize older messages).
+  Gateway triggers compaction via pluggable context engine.
+  Staged summarization: split into N parts, summarize each, merge.
+  Adaptive chunk ratio shrinks when messages are large relative to context.
+  Identifier preservation (UUIDs, URLs, hashes) survives summarization.
   If compacted → retry prompt.
 
 Tier 3: Tool Result Truncation
-  Identify oversized tool results (e.g. a 500KB file read).
-  Truncate to fit within context window.
+  Identify oversized tool results (>30% of context window).
+  Smart head+tail strategy: if tail contains errors/diagnostics, preserve both ends.
+  Hard limit: 400KB per result, minimum 2K chars always kept.
   If truncated → retry prompt.
+
+Tier 4: Thinking Level Downgrade
+  Reduce extended thinking budget to free token space.
+  Frees token budget for actual content.
+
+Tier 5: Auth Profile Rotation
+  Switch to a different model/provider that may have a larger context window.
 ```
 
 **Key implementation details:**
 - Detect overflow via error message pattern matching (`isLikelyContextOverflowError`)
-- Track compaction attempts per run to avoid infinite compact-retry loops
-- Measure per-message character counts to find the biggest contributors
-- Estimate tokens to determine if truncation will actually help
+- Extract observed token count from error message for precise budget adjustment
+- Track compaction attempts per run to avoid infinite compact-retry loops (max 3)
+- Pre-compaction memory flush: optional agentic turn to store notes before compacting
+- Post-compaction section re-injection: preserve critical sections ("Session Startup", "Red Lines")
+- Compaction safety timeout: 15 minutes default with abort signal
+- Orphaned tool_result repair after chunk drops
 
-**Why it matters:** A single large tool result (file read, API response) can fill the entire context window. Compaction alone won't help — you need targeted truncation of the oversized result.
+**Why it matters:** A single large tool result (file read, API response) can fill the entire context window. Compaction alone won't help — you need targeted truncation of the oversized result, plus fallback strategies when compaction isn't enough.
 
-> See: [code_snippets/context_overflow_recovery.ts](./code_snippets/context_overflow_recovery.ts)
+> See: [code_snippets/openclaw/context_overflow_recovery.ts](./code_snippets/openclaw/context_overflow_recovery.ts), [code_snippets/openclaw/compaction_algorithm.ts](./code_snippets/openclaw/compaction_algorithm.ts)
 
 ---
 
@@ -330,6 +352,93 @@ def handle_crash_storm():
 
 ---
 
+## 12. Pluggable Context Engine
+
+Abstract compaction and context assembly behind a pluggable interface so custom strategies can be swapped without touching the core agent loop.
+
+**Interface lifecycle:**
+```
+bootstrap() → ingest(msg) → afterTurn() → assemble(budget) → compact() → dispose()
+                                              │
+                                    prepareSubagentSpawn() → onSubagentEnded()
+```
+
+**Key design decisions:**
+- Engines own *how* context is stored and retrieved; the runtime owns transcript I/O
+- `CompactResult` carries token counts (before/after) so the caller can track savings
+- Transcript rewrites via runtime callback — engines request rewrites through `runtimeContext.rewriteTranscriptEntries()`, keeping engine logic decoupled from session DAG implementation
+- Process-global registry using `Symbol.for()` so duplicated bundles share state
+- Two registration paths: core (trusted, can refresh) vs public SDK (unprivileged)
+- Legacy compatibility proxy: auto-strips unrecognized params for older engines
+
+**Why it matters:** Different use cases need different compaction strategies (aggressive summarization for chatbots, careful preservation for coding agents). A pluggable interface lets plugins provide custom engines without forking the core.
+
+> See: [code_snippets/openclaw/context_engine.ts](./code_snippets/openclaw/context_engine.ts) | Source: [OpenClaw](./inspections/openclaw.md)
+
+---
+
+## 13. Subagent Registry with Announce Dispatch
+
+When sub-agents complete, their results must reliably reach the parent — even across gateway restarts. A centralized registry with push-based delivery solves this.
+
+**Pattern:**
+```
+Subagent completes → Freeze result text (up to 100KB)
+  → Announce dispatch (3-phase):
+      1. Try queue-primary (debounced, batched)
+      2. Try direct delivery (immediate, for completion messages)
+      3. Fallback queue (if primary fails)
+  → Exponential backoff retry (1s → 2s → 4s, max 3 attempts)
+  → Expiry: 5 min (non-completion), 30 min (completion flow)
+```
+
+**Orphan recovery (after gateway restart):**
+- Scan registry for runs with `abortedLastRun = true`
+- Build resume message with original task + last human message
+- Retry with exponential backoff (5s initial, 3 max retries, 2x multiplier)
+
+**Key design decisions:**
+- Push-based announce: explicit instruction to agents "do NOT poll — wait for completion events"
+- Frozen result capture: latest assistant text preserved so delayed delivery still carries content
+- Registry persisted to disk (`subagents/runs.json`, V2 format) for restart survival
+- `SubagentRunRecord` tracks 30+ lifecycle fields (created → started → ended → cleaned up)
+- Lifecycle error grace period: defers terminal cleanup 15s to tolerate transient provider errors
+
+**Why it matters:** Without reliable result delivery, subagent work gets lost on timeouts or restarts. Polling wastes tool calls and clutters context.
+
+> See: [code_snippets/openclaw/subagent_registry.ts](./code_snippets/openclaw/subagent_registry.ts) | Source: [OpenClaw](./inspections/openclaw.md)
+
+---
+
+## 14. Session Write Locking with Staleness Detection
+
+JSONL session files need exclusive write access. File-based locking with PID recycling detection prevents corruption from concurrent writers and stale locks from crashed processes.
+
+**Pattern:**
+```
+Lock file: { pid, createdAt (ISO), starttime (clock ticks from /proc/pid/stat) }
+
+Acquire:
+  1. Try O_EXCL atomic create → success
+  2. Lock exists? → inspect for staleness:
+     - Dead PID → stale, reclaim
+     - Alive PID, different starttime → recycled PID, stale, reclaim
+     - Alive PID, same starttime, age > threshold → stale, reclaim
+     - Alive PID, same starttime, fresh → contended, retry with backoff
+  3. Reentrant: same process → increment ref count
+
+Release:
+  - Decrement ref count → if 0, unlink lock file
+  - Signal handlers (SIGINT/SIGTERM/SIGQUIT/SIGABRT) → synchronous cleanup
+  - Watchdog timer (60s interval) → force-release locks held > 5 minutes
+```
+
+**Why it matters:** PID-only locking is broken on long-running servers — PIDs recycle after process death. Start time comparison catches this. Watchdog cleanup prevents deadlocks from killed processes that couldn't run signal handlers.
+
+> See: [code_snippets/openclaw/session_write_lock.ts](./code_snippets/openclaw/session_write_lock.ts) | Source: [OpenClaw](./inspections/openclaw.md)
+
+---
+
 ## 5. Anti-Patterns & Pitfalls
 
 | Anti-pattern | Why it's bad | Fix |
@@ -337,7 +446,10 @@ def handle_crash_storm():
 | Flat tool allow/deny lists | Can't express per-agent, per-provider, per-group policies | Use layered policy pipeline (see §2) |
 | Uniform sub-agent capabilities | Sub-agents at any depth can spawn more children → recursion bombs | Depth-aware tool deny lists (see §3) |
 | Single auth credential | One rate limit or outage kills the agent | Auth profile failover with cooldown (see §1) |
-| Crash on context overflow | Long conversations just stop working | 3-tier recovery: compact → re-compact → truncate (see §4) |
+| Crash on context overflow | Long conversations just stop working | 5-tier recovery: compact → re-compact → truncate → downgrade thinking → rotate model (see §4) |
+| Hardcoded compaction strategy | Different use cases need different approaches | Pluggable context engine interface (see §12) |
+| Polling for subagent results | Wastes tool calls, clutters parent context | Push-based announce dispatch with frozen result capture (see §13) |
+| PID-only file locking | PID recycling → two processes think they hold the lock | PID + starttime staleness detection with watchdog (see §14) |
 | No session serialization | Concurrent messages to same agent corrupt state | Nested lane queues (see §5) |
 | Async hooks on hot paths | Message serialization stalls on slow plugins | Enforce sync-only hooks where latency matters (see §6) |
 | Pure vector OR pure keyword search | Misses exact names or semantic paraphrases | Hybrid search with weighted merge (see §7) |
