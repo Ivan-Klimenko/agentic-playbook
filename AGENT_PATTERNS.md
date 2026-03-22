@@ -68,15 +68,34 @@ Why this works:
 
 - Wrap sub-agent invocations in try/except. Return structured error via `ToolMessage`, not an exception. Let the orchestrator LLM decide how to handle it.
 - Set `recursion_limit` per graph. A runaway ReAct loop is the most common failure mode.
-- Provide fallback paths: if a specialized approach fails (e.g., `create_react_tunnel`), fall back to a manual ReAct with `ToolNode`.
-- Stub/circuit-breaker: check external service health before entering the main agent loop. Short-circuit with a canned response when the backend is down.
+- Provide fallback paths: if a specialized approach fails, fall back to a manual ReAct with `ToolNode`.
+- Stub/circuit-breaker: check external service health before entering the main agent loop.
 - **Error messages for LLM consumption**: design tool error strings with actionable information (valid options, what went wrong, how to retry). The LLM is the consumer, not a human.
+
+**Error-typed provider failover (multi-model agents):**
+
+When an LLM call fails, classify the error by type and select a recovery strategy per type:
+
+```
+Error arrives → classify:
+  401/403        → "auth"       → refresh token, then rotate profile
+  402            → "billing"    → mark profile, rotate immediately
+  429            → "rate_limit" → backoff (exponential), then rotate
+  503            → "overloaded" → backoff, rotate
+  408/ETIMEDOUT  → "timeout"    → rotate (no cooldown — timeouts aren't auth issues)
+```
+
+Key decisions: cooldown per profile (not global), probe cooldowned profiles periodically (throttled to 1/30s), walk `error.cause` recursively (providers wrap errors inconsistently), backoff policy per reason (rate_limit gets backoff; auth gets rotation).
+
+**Anti-pattern:** Treating all errors the same (retry + rotate). This hammers a rate-limited provider, wastes time refreshing tokens on billing errors, and applies cooldown to timeouts that don't need it.
+
+> Source: [OpenClaw](./inspections/openclaw.md) §8.6
 
 ### 2.5 Dynamic State Injection (Working Memory)
 
-Give the LLM a structured "working memory" view of accumulated state (plan progress, references, intermediate results) without relying on it to parse long message histories.
+Give the LLM a structured "working memory" view of accumulated state without relying on it to parse long message histories.
 
-**Where to inject:** into the **latest user message**, not the system prompt. The system prompt should stay static (role, instructions, tool docs, few-shot examples) so it remains cached across turns (see §3.7). Modifying the system prompt on every call invalidates the entire prompt cache — system and all messages — defeating prefix reuse.
+**Where to inject:** into the **latest user message**, not the system prompt. The system prompt should stay static so it remains cached across turns (see §3.7).
 
 ```
 System prompt (STATIC — cached once, reused every turn):
@@ -87,7 +106,6 @@ Latest user message (DYNAMIC — appended each turn, after cached prefix):
     <plan>
       1. [completed] Fetch CFR data for A
       2. [in_progress] Fetch CFR data for B
-      3. [pending] Compare and analyze
     </plan>
     <active_references>
       metrics_a1b2: CFR data for A (metrics, diff)
@@ -97,352 +115,139 @@ Latest user message (DYNAMIC — appended each turn, after cached prefix):
   [actual user query or tool results here]
 ```
 
-Best format: structured text (XML tags, markdown sections). Keeps it parseable but doesn't waste tokens on JSON syntax.
-
-**In framework code** (e.g., LangGraph), inject the working memory block by prepending it to the latest `HumanMessage` content before the LLM call, or as a separate content block within the same message. The prior conversation history remains untouched, preserving the cached prefix.
+Best format: structured text (XML tags, markdown sections). In framework code, inject by prepending to the latest `HumanMessage` content before the LLM call.
 
 ### 2.6 Agents-as-Config (No Agent Classes)
 
-Instead of building agent classes with behavior (methods, inheritance, state machines), define agents as **named configuration objects**. The runtime is generic — it interprets configs to assemble prompts, select tools, and enforce permissions.
+Define agents as **named configuration objects**, not classes with behavior. The runtime is generic — it interprets configs to assemble prompts, select tools, and enforce permissions.
 
 ```typescript
-// Agent is a pure config — no execute(), no run(), no behavior
 AgentConfig = {
   name: string,
   mode: "primary" | "subagent" | "hidden",
-  prompt: string,             // system prompt (or use provider default)
+  prompt: string,             // system prompt
   permission: Ruleset,        // tool access rules (declarative)
   model: { provider, id },    // optional model override
-  temperature: number,
   steps: number,              // max agentic iterations
 }
 ```
 
-**Built-in + custom parity:** Agents loaded from markdown frontmatter or JSON config use the same schema as built-in agents. Custom agents are first-class citizens, not second-class plugins.
-
-```markdown
----
-mode: subagent
-temperature: 0.7
-model: openai/gpt-4o
-permission:
-  bash: deny
-  edit: { "*.test.ts": allow, "*": deny }
----
-You are a code reviewer. Focus on test quality...
-```
-
 **Why configs, not classes:**
-- **Adding a new agent = adding a config file**, not writing code. Non-engineers can create agents.
-- **Runtime stays generic** — one loop handles all agents. Testing, debugging, and profiling apply uniformly.
-- **Composition via merging** — agent permissions merge with defaults and user overrides. No inheritance hierarchies.
-- **Hot-reloadable** — config changes take effect without restarting the runtime.
+- Adding a new agent = adding a config file, not writing code
+- Runtime stays generic — one loop handles all agents
+- Composition via merging — permissions merge with defaults and user overrides
+- Hot-reloadable — config changes take effect without restart
 
-**Hidden agents:** System agents (compaction, title generation, summarization) use the same schema with `hidden: true`. The runtime calls them programmatically, but they're configs like everything else.
+**When to use classes instead:** When agents need genuinely different execution strategies (graph topology, custom tool orchestration). But often what feels like "different behavior" is really "different config."
 
-**When to use classes instead:** When agents need genuinely different execution strategies (graph topology, custom tool orchestration). But often what feels like "different behavior" is really "different config" — different tools, different prompts, different permissions.
+### 2.7 Mode Switching via Synthetic Messages
 
-### 2.7 Agent Mode Switching via Synthetic Messages
-
-Switch between agents within the same session by injecting **synthetic user messages** with an agent field. The loop picks up the agent field on the next iteration and resolves the corresponding config. No graph rewiring, no state machine transitions.
+Switch between agents within the same session by injecting synthetic user messages with an agent field. The loop resolves the corresponding config on the next iteration — no graph rewiring.
 
 ```
-Agent A (plan) working in session:
-  │
-  ├─ Agent calls mode_switch tool
-  │   ├─ Tool asks user for confirmation (optional)
-  │   └─ Creates synthetic user message:
-  │       { role: "user", agent: "build", text: "Mode approved. Execute the plan." }
-  │
-  ├─ Loop picks up synthetic message on next iteration:
-  │   agent = resolve(lastUserMessage.agent)  // "build"
-  │   tools = resolve(agent.permissions)       // full tool access
-  │   reminders = buildReminders(prevAgent → newAgent)
-  │
-  └─ Agent B (build) continues in same session with same history
+Agent A (plan) → calls mode_switch tool
+  → Creates synthetic message: { role: "user", agent: "build", text: "Execute the plan." }
+  → Loop picks up agent="build", resolves tools/permissions
+  → Agent B (build) continues in same session with same history
 ```
 
-**Why synthetic messages, not state transitions:**
-- **Conversation history preserved** — Agent B sees everything Agent A did (exploration, Q&A, reasoning)
-- **No special state machine** — the main loop already processes user messages; synthetic messages are just messages
-- **Auditable** — the mode switch appears in message history as a regular turn
-- **Prompt-injectable** — `insertReminders()` detects agent transitions and injects context-specific instructions (e.g., "you switched from plan to build, a plan file exists at X")
-
-**Common mode transitions:**
-- Plan → Build (read-only exploration → full edit access)
-- Build → Plan (user wants to step back and redesign)
-- Primary → Subagent (delegation via task tool — creates child session instead)
+Conversation history is preserved, the switch is auditable, and `insertReminders()` can inject transition-specific instructions.
 
 ### 2.8 Parallel Multi-Tool Execution (Batch Tool)
 
-Let the LLM request multiple independent tool calls in a single response, executed in parallel via `Promise.all()`. This cuts wall-clock time for parallel-safe operations (reading multiple files, searching multiple patterns).
+Let the LLM request multiple independent tool calls in a single response, executed in parallel. This cuts wall-clock time for parallel-safe operations (file reads, searches, fetches).
 
-```
-Without batch:                        With batch:
-  LLM → read(a.ts)  → result          LLM → batch([
-  LLM → read(b.ts)  → result                  read(a.ts),
-  LLM → grep("TODO") → result                 read(b.ts),
-  3 sequential round-trips                     grep("TODO")
-                                             ]) → all results
-                                       1 round-trip, parallel execution
-```
+Design decisions: disallow nesting (no batch-in-batch), per-call permission checks, per-call state tracking for UI streaming. **When NOT to use:** tool calls with dependencies or conflicting side effects.
 
-**Design decisions:**
-- **Disallow nesting** — batch inside batch is blocked (prevents exponential fan-out)
-- **Per-call permission checks** — each call within the batch gets independent permission evaluation
-- **Per-call state tracking** — each sub-call has its own lifecycle (running → completed/error) for UI streaming
-- **Aggregated result** — `"Batch execution (N/M successful)"` with per-call outputs concatenated
+### 2.9 Two-Tier Model Strategy
 
-**When to use:** Any agent with tools that are frequently called in parallel-safe sequences. Particularly effective for: file reading, code search, web fetching, API calls to independent endpoints.
-
-**When NOT to use:** When tool calls have dependencies (read result informs next edit) or when tools have side effects that could conflict (two edits to the same file).
-
-### 2.9 Pre-processing & Shortcuts
-
-Not every request needs the full agent loop. Add a lightweight pre-processing node before the LLM:
-- **Button/command detection**: exact text match → skip LLM entirely, call the right API directly
-- **Stub/maintenance check**: query backend health → return canned response if down
-- **Classification cache**: if the same query type was just classified, reuse the result
-
-This saves latency and tokens for predictable inputs.
-
-### 2.10 Two-Tier Model Strategy
-
-Use different models for different cognitive loads within the same agent pipeline:
-
-- **Expensive model** (Claude Sonnet/Opus) — reasoning, planning, orchestration, tool selection
+Use different models for different cognitive loads:
+- **Expensive model** (Sonnet/Opus) — reasoning, planning, orchestration, tool selection
 - **Cheap model** (GPT-4o-mini, Haiku) — summarization, extraction, classification, formatting
 
-Typical application: a search tool fetches web content, a cheap model summarizes it into a structured result (Pydantic schema), and the expensive model reasons over the summaries.
+Summarization doesn't need frontier-model reasoning — it's a compression task.
 
-**Why it works:** Summarization doesn't need frontier-model reasoning — it's a compression task. Routing it to a cheap model saves tokens on the main agent's context window while keeping the pipeline fast.
+### 2.10 No-Plan Architecture (Planning via System Prompt)
 
-### 2.11 No-Plan Architecture (Planning via System Prompt)
+Not every agent needs a formal plan-and-execute phase. Delegate planning to the LLM via the system prompt — no plan object, no plan tool, no plan state machine.
 
-Not every agent needs a formal plan-and-execute phase. You can delegate planning entirely to the LLM via the system prompt — no plan object, no plan tool, no plan state machine.
+**When this works:** Conversational agents (1-5 tool calls), diverse task types, latency-sensitive environments.
 
-**When this works:**
-- Conversational agents where most interactions are 1-5 tool calls
-- Diverse, unpredictable task types (messaging channels with open-ended queries)
-- Latency-sensitive environments where a planning call doubles response time
+**When you need explicit planning:** Complex multi-step tasks (20+ tool calls), plan visibility for user approval, parallel fan-out requiring upfront decomposition.
 
-**When you need explicit planning:**
-- Complex multi-step tasks requiring 20+ tool calls
-- Tasks where plan visibility matters (user wants to approve the approach)
-- Tasks requiring parallel fan-out to sub-agents (need a plan to know what to fan out)
+**The tradeoff:** Without explicit planning, the agent can lose coherence on long runs. Mitigate through TODO anchoring (§3.1), think tool (§3.6), and context recovery (§3.10).
 
-**The tradeoff:** Without explicit planning, the agent can lose coherence on long runs. Mitigate through TODO anchoring (§3.1), think tool (§3.6), and context recovery (§3.10) — not through plan-and-execute.
+**Prompt-driven plan alternative:** The plan agent writes a plan to a markdown file, then mode-switches (§2.7) to a build agent. The build agent reads the plan file and follows it using standard tools. The plan is a regular file — human-readable, no schema, no engine. TodoWrite provides optional progress tracking. This works when the LLM is capable enough to follow written instructions reliably.
 
-**Practical implication:** If you start with a no-plan architecture and find the agent drifting on long tasks, add a TODO/plan tool (§3.1) rather than redesigning the entire loop. Planning can be incremental.
+### 2.11 Pure LLM Tool Selection (No Planner, No Router)
 
-### 2.12 Pure LLM Tool Selection (No Planner, No Router)
-
-Use no tool routing logic — the LLM selects tools purely from its available tool set. No planner scores tool relevance. No rule-based router pre-filters. No tool recommendation engine suggests options.
+No tool routing logic — the LLM selects tools purely from its available tool set.
 
 **Why this works at scale (30+ tools, 50+ skills):**
-1. **Policy filtering** — a tool policy pipeline removes tools the agent shouldn't use, so the LLM only sees relevant tools
-2. **Canonical ordering** — core tools listed first in a fixed order prevents positional bias
-3. **Dynamic descriptions** — tool descriptions extracted from tool objects, not hardcoded, so they stay accurate
-4. **Skill budget** — skills listed as a scannable catalog, not inlined, preventing prompt bloat
+1. Policy filtering removes tools the agent shouldn't use
+2. Canonical ordering prevents positional bias
+3. Dynamic descriptions stay accurate
+4. Skills listed as catalog, not inlined
 
-**When you need a planner/router:**
-- When tool selection accuracy drops below acceptable thresholds with pure LLM choice
-- When you have 100+ tools and the LLM can't reliably pick the right one
-- When tool selection needs deterministic guarantees (compliance, safety-critical)
+**When you need a planner/router:** 100+ tools, accuracy drops below threshold, deterministic guarantees required. **Anti-pattern:** Adding a tool recommender as first optimization — improve descriptions and ordering first.
 
-**Anti-pattern to avoid:** Don't add a tool recommender as a first optimization. Instead, improve tool descriptions, reduce the tool set via policy filtering, and fix ordering. These are cheaper and often sufficient.
+### 2.12 Fuzzy Tool Input Resilience
 
-### 2.13 Fuzzy Tool Input Resilience (Fallback Matching)
+LLMs hallucinate whitespace, indentation, and escape characters. For tools requiring exact matching (find-and-replace), use a **fallback chain of increasingly fuzzy matchers**: exact → whitespace-trimmed → whitespace-normalized → indentation-agnostic → escape-normalized → context-aware anchoring.
 
-LLMs are imprecise about whitespace, indentation, escape characters, and exact string reproduction. When a tool requires exact matching (e.g., find-and-replace in a file), don't fail on the first mismatch — use a **fallback chain of increasingly fuzzy matchers**.
+First strategy producing exactly ONE unique match wins. Multiple matches → try next strategy (ambiguity is worse than no match). Each strategy is a lazy generator — expensive strategies only run if cheap ones fail. Takes edit tool success rate from ~80% to ~98%.
 
-**Pattern — generator-based fallback chain:**
-```
-Tool receives (old_string, new_string, file_content):
-  │
-  ├─ Strategy 1: Exact string match
-  ├─ Strategy 2: Line-by-line whitespace-trimmed
-  ├─ Strategy 3: First/last line anchors + body similarity
-  ├─ Strategy 4: Whitespace-normalized
-  ├─ Strategy 5: Indentation-agnostic
-  ├─ Strategy 6: Escape sequence normalization
-  ├─ Strategy 7: Trimmed content boundaries
-  ├─ Strategy 8: Context-aware (context lines + >50% body similarity)
-  └─ Strategy 9: Multi-occurrence (for replace-all operations)
+> See: [OpenCode](./inspections/opencode.md) — `code_snippets/opencode/tool_system.ts`
 
-  First strategy that produces exactly ONE unique match wins.
-  Multiple matches → try next strategy (ambiguity is worse than no match).
-```
+### 2.13 Post-Model Guardrails
 
-**Why generators:**
-```typescript
-// Each strategy is a generator yielding candidate match strings
-function* whitespaceNormalized(needle, haystack) {
-  const normalized = normalize(needle)
-  for (const candidate of findCandidates(haystack)) {
-    if (normalize(candidate) === normalized) yield candidate
-  }
-}
-
-// First unique match from any strategy wins
-for (const strategy of strategies) {
-  const matches = [...strategy(oldString, fileContent)]
-  if (matches.length === 1) return applyEdit(matches[0], newString)
-}
-```
-
-- Lazy evaluation — expensive strategies only run if cheap ones fail
-- Each strategy independently validates uniqueness (single match)
-- New strategies can be added to the chain without modifying existing ones
-
-**Impact:** In practice, this takes edit tool success rate from ~80% (exact match only) to ~98% (with fuzzy chain). The LLM hallucinates whitespace frequently, but the semantic intent is usually correct.
-
-**When to apply this pattern:** Any tool where the LLM must reproduce exact content from memory (find-and-replace, patch application, code insertion at specific locations). Less relevant for tools with structured parameters (API calls, file paths).
-
-### 2.14 Post-Model Guardrails (Belt-and-Suspenders Enforcement)
-
-Prompt-level instructions ("max 3 task calls per response") are best-effort — the LLM can and will violate them. `recursion_limit` catches infinite loops but not per-turn overcommitment. Add a third enforcement layer: **post-model output processing** that silently corrects violations before tool execution.
-
-**Pattern — `after_model` hook:**
-```python
-class SubagentLimitMiddleware:
-    def __init__(self, max_concurrent: int = 3):
-        self.max_concurrent = clamp(max_concurrent, 2, 4)
-
-    def after_model(self, state):
-        last_msg = state["messages"][-1]
-        tool_calls = last_msg.tool_calls
-
-        # Find task tool calls that exceed the limit
-        task_indices = [i for i, tc in enumerate(tool_calls) if tc["name"] == "task"]
-        if len(task_indices) <= self.max_concurrent:
-            return None  # no correction needed
-
-        # Silently drop excess task calls
-        indices_to_drop = set(task_indices[self.max_concurrent:])
-        truncated = [tc for i, tc in enumerate(tool_calls) if i not in indices_to_drop]
-        return {"messages": [last_msg.copy(update={"tool_calls": truncated})]}
-```
+Prompt instructions are best-effort — the LLM will violate them. Add **post-model output processing** that silently corrects violations before tool execution.
 
 **Three enforcement layers (use all three):**
 
 | Layer | When | Mechanism | Failure mode |
 |-------|------|-----------|--------------|
-| Prompt instructions | Before generation | "Max N task calls per response" | LLM ignores it (~10-20% of the time) |
-| Post-model guardrail | After generation, before execution | `after_model` hook truncates excess | Silent, deterministic, no token cost |
-| Recursion limit | Across turns | `recursion_limit=100` | Stops infinite loops but not per-turn excess |
+| Prompt instructions | Before generation | "Max N task calls per response" | LLM ignores (~10-20%) |
+| Post-model guardrail | After generation | `after_model` hook truncates excess | Silent, deterministic |
+| Recursion limit | Across turns | `recursion_limit=100` | Stops infinite loops |
 
-**Why silent truncation, not error feedback:** Returning an error ("you called too many tools") wastes a turn — the LLM retries with fewer calls, costing tokens and latency. Silent truncation achieves the same result in zero extra turns. The system prompt warns "excess calls are silently discarded" so the LLM learns to self-limit.
+**Why silent truncation, not error feedback:** Returning an error wastes a turn. Silent truncation achieves the same result in zero extra turns.
 
-**When to apply:** Any constraint the LLM frequently violates despite clear prompt instructions. Common cases: max parallel tool calls, forbidden tool combinations, output format requirements that can be mechanically verified.
+### 2.14 Tool Mutation Tracking (Action Fingerprinting)
 
-### 2.15 Prompt-Driven Plan Execution (No Engine)
-
-An alternative to formal plan-and-execute architectures: use **prompt injection and convention** to drive plan execution, with no plan parser, step tracker, or execution engine.
+When tools have side effects, track *which specific action* caused an error and only clear the error state when the *same action* succeeds — not when any unrelated tool succeeds.
 
 ```
-Plan phase:
-  Plan agent explores codebase, writes plan to a markdown file
-  Plan agent calls plan_exit → synthetic message switches to build agent
-
-Execution phase:
-  Build agent receives: "A plan file exists at {path}. Execute it."
-  Build agent reads the plan file with the read tool
-  Build agent follows the plan using standard tools
-  Build agent tracks progress via TodoWrite (optional, prompt-guided)
+Tool call → mutating? → build fingerprint: "tool=write|action=create|path=config.yaml"
+  → on error: store { fingerprint, error }
+  → on success: clear ONLY IF fingerprint matches stored error
+  Non-mutating tools → clear error immediately on success
 ```
 
-**What makes this work:**
-1. **The plan is a regular file** — markdown, no schema, no structured format. The LLM writes natural language.
-2. **Execution is just "read file, follow instructions"** — the build agent already knows how to use tools. The plan file is just context.
-3. **TodoWrite provides progress tracking** — the agent creates a task list from plan steps and marks items complete as it works. This is prompt-guided, not enforced.
-4. **The user sees the plan** — it's a readable markdown file, not an internal data structure.
+**Why this matters:** Without action fingerprinting, agents develop "false recovery" — they believe a problem is fixed because *some* tool succeeded, when the actual failing operation was never retried. The failure is subtle: the agent's behavior looks correct (tried something, got success, moved on) but the underlying issue persists.
 
-**Tradeoffs vs. structured plan-and-execute:**
-| | Prompt-driven | Structured engine |
-|---|---|---|
-| Plan format | Free-form markdown | Schema-enforced steps |
-| Step tracking | Optional (TodoWrite) | Built-in state machine |
-| Verification | Prompt-guided | Programmatic assertions |
-| Flexibility | Agent adapts freely | Steps execute in order |
-| Debuggability | Read the plan file | Inspect step execution state |
+Mutating tools: write, edit, exec, deploy. Action-dependent: process (write/send_keys/kill), message (send/reply/delete). Never: read, glob, grep, search.
 
-**When prompt-driven works:** When the LLM is capable enough to follow a written plan reliably (frontier models). When plans need human readability. When rigid step ordering would be too constraining.
+> Source: [OpenClaw](./inspections/openclaw.md) §8.5
 
-**When you need a structured engine:** When plans must execute in exact order. When step failures need programmatic fallbacks. When plan compliance must be verified mechanically (audit requirements).
+### 2.15 Push-Based Sub-Agent Results (No Polling)
 
-### 2.16 Markdown-as-Code Plugin Primitives
-
-Define agents, commands, skills, and hooks entirely in **markdown files** with YAML frontmatter. No code needed — the runtime interprets markdown as executable configuration. Four orthogonal primitives compose into rich workflows:
-
-| Primitive | Trigger | What it is |
-|-----------|---------|------------|
-| **Command** | User invokes `/slash` | Structured workflow with phases, HITL gates, agent launches |
-| **Agent** | LLM detects trigger condition | Autonomous sub-agent with own model, tools, color |
-| **Skill** | LLM detects domain relevance | Progressive-disclosure knowledge package (metadata → body → resources) |
-| **Hook** | System event fires | Script or LLM-evaluated interception of tool calls, stop signals, etc. |
-
-```markdown
-# Agent definition — the entire file IS the agent
----
-name: code-reviewer
-description: Use this agent when code was just written or modified...
-tools: [Read, Grep, Glob]
-model: opus
-color: green
-maxTurns: 20
----
-You are an expert code reviewer. Rate each issue 0-100...
-Only report issues with confidence ≥ 80.
-```
-
-**Key design properties:**
-- **Non-developers can create agents** — no code, just markdown with YAML frontmatter
-- **Convention-based discovery** — files in `commands/`, `agents/`, `skills/` dirs are auto-discovered
-- **Progressive skill loading** — metadata (~100 words) always in context; full SKILL.md (<5k words) loaded on trigger; `references/` and `scripts/` loaded on demand. Keeps token budget efficient.
-- **Commands orchestrate agents** — a command's markdown body defines a multi-phase workflow that launches agents at specific phases
-
-**When to use:** CLI tools, IDE extensions, or any system where extensibility matters more than execution speed. The markdown format is LLM-native — the AI can read, write, and debug plugins naturally.
-
-> See: [Claude Code inspection](./inspections/claude_code.md) §1, `code_snippets/claude_code/plugin_system.md`
-
-### 2.17 Event-Driven Hook Interception
-
-Intercept the agent loop at well-defined lifecycle events without modifying the core runtime. Hooks are registered declaratively (JSON) and execute as either **command hooks** (external scripts) or **prompt hooks** (LLM-evaluated).
+When sub-agents complete, deliver results to the parent via push — don't let the parent poll.
 
 ```
-Agent Loop:  plan → [PreToolUse] → execute tool → [PostToolUse] → observe → ... → [Stop]
-                       │                                │                            │
-                   Hook fires:                    Hook fires:                   Hook fires:
-                   validate/block                 lint/format                   check tests ran
+Anti-pattern:                           Pattern:
+  Parent calls sessions_list ×3           Child completes → result pushed
+  Parent calls sessions_history ×3        as user message to parent
+  = 6 wasted tool calls                  = 0 tool calls to collect
 ```
 
-**Hook events:** PreToolUse, PostToolUse, Stop, SubagentStop, SessionStart, SessionEnd, UserPromptSubmit, PreCompact, PostCompact, StopFailure, Notification
+Key design decisions:
+- **Explicit instruction in spawn response:** "Do NOT call sessions_list. Wait for completion events as user messages."
+- **Frozen result capture:** Freeze last assistant text (capped 100KB) on completion for delayed delivery
+- **Delivery retry:** Exponential backoff (1s → 2s → 4s, max 3 attempts); 5 min expiry for status, 30 min for completion
+- **Push for completion, poll for progress:** Polling is acceptable only for in-progress status checks
 
-**Hook I/O protocol (command hooks):**
-```
-stdin: JSON { tool_name, tool_input, hook_event_name, transcript_path }
-stdout: JSON { permissionDecision: "allow|deny|ask", systemMessage: "...", updatedInput: {...} }
-exit: 0=allow, 1=show stderr to user, 2=block+show to Claude
-```
-
-**Prompt hooks** — the LLM itself decides:
-```json
-{
-  "type": "prompt",
-  "prompt": "If command contains 'rm -rf', return 'deny'. Otherwise 'approve'."
-}
-```
-
-**Key patterns:**
-- **Stop hooks as quality gates**: Block stopping until tests run, build passes, or docs updated. The agent literally cannot finish without meeting criteria.
-- **PreToolUse validation**: Block dangerous commands, validate file paths, enforce style before writes.
-- **Fail-safe design**: All hooks MUST exit 0 on error — never block operations due to hook failures.
-- **Hot-reloadable rules**: Load rule files from disk on every invocation, no restart needed.
-
-**The Stop hook is particularly powerful** — it converts "quality suggestions" into "hard enforcement". The agent can decide it's done, but the Stop hook says "no, run the tests first."
-
-> See: [Claude Code inspection](./inspections/claude_code.md) §6, `code_snippets/claude_code/stop_hook_quality_gate.md`
+> Source: [OpenClaw](./inspections/openclaw.md) §8.1
 
 ---
 
@@ -452,12 +257,12 @@ As agent tasks grow longer (~50+ tool calls), **context rot** becomes the primar
 
 ### 3.1 TODO Lists as Context Anchors
 
-A TODO tool that the agent continuously rewrites to combat context rot. Inspired by Claude Code's `TodoWrite` and Manus.
+A TODO tool that the agent continuously rewrites to combat context rot.
 
 **Core insight**: forcing the LLM to rewrite the full TODO list acts as self-prompting — it recites its objectives at the end of the context, re-anchoring attention.
 
 **Design decisions:**
-- **Full overwrite, not append**: the LLM rewrites the entire list each time, allowing it to reprioritize and prune. No custom reducer — each update replaces the list.
+- **Full overwrite, not append**: the LLM rewrites the entire list each time, allowing it to reprioritize and prune.
 - **One `in_progress` at a time**: prevents the agent from losing focus across concurrent tasks.
 - **Write-read-reflect cycle**: after completing a task, read the TODO back, reflect on progress, then update.
 
@@ -466,97 +271,30 @@ class Todo(TypedDict):
     content: str
     status: Literal["pending", "in_progress", "completed"]
 
-class DeepAgentState(AgentState):
-    todos: NotRequired[list[Todo]]  # absent in initial state, no mandatory init
-
 @tool(description=WRITE_TODOS_DESCRIPTION, parse_docstring=True)
-def write_todos(
-    todos: list[Todo],
-    tool_call_id: Annotated[str, InjectedToolCallId],
-) -> Command:
-    """Create or update the full TODO list.
-
-    Args:
-        todos: Complete list of all tasks with their statuses.
-    """
+def write_todos(todos: list[Todo], tool_call_id: Annotated[str, InjectedToolCallId]) -> Command:
     return Command(update={
         "todos": todos,
         "messages": [ToolMessage(f"Updated todo list to {todos}", tool_call_id=tool_call_id)],
     })
 ```
 
-**Prompt workflow** (instruct the agent):
-1. Create TODO at the start of every task
-2. After completing a TODO, call `read_todos` to remind yourself
-3. Reflect on what you've done and what's next
-4. Mark task completed, set next task to `in_progress`
-5. Batch research tasks into a single TODO to reduce overhead
-
 ### 3.2 Virtual Filesystem for Context Offloading
 
-A `dict[str, str]` backed virtual filesystem stored in agent state. Agents write token-heavy content (search results, analysis drafts, collected data) to files and keep only lightweight summaries in messages.
+A `dict[str, str]` virtual filesystem in agent state. Agents write token-heavy content (search results, analysis drafts) to files and keep only lightweight summaries in messages.
 
-**Why virtual, not real files:**
-- Enables backtracking and restoring via checkpointing — impossible with real disk I/O
-- Thread-scoped persistence: files live for the duration of a conversation, not beyond
-- No filesystem permissions, sandboxing, or cleanup concerns
+**Why virtual, not real files:** Enables backtracking via checkpointing, thread-scoped persistence, no sandbox concerns.
 
-```python
-def file_reducer(left: dict | None, right: dict | None) -> dict:
-    """Merge-dict reducer: new values overwrite existing keys, other keys preserved."""
-    if left is None: return right
-    if right is None: return left
-    return {**left, **right}
+**Key:** `write_file` returns only a confirmation in the `ToolMessage`, NOT the file content. Heavy content goes to state; lightweight acknowledgment goes to messages. For long-running agents, save collected content to files immediately — before context compression can eliminate it (orient → save → read workflow).
 
-class DeepAgentState(AgentState):
-    files: Annotated[NotRequired[dict[str, str]], file_reducer]
-```
+### 3.3 Context Isolation via Sub-Agents
 
-**Tool suite**: `ls`, `read_file` (with offset/limit pagination, `cat -n` line numbers, 2000-char line truncation), `write_file`, `edit_file` (exact string matching).
-
-**Key**: `write_file` returns only a confirmation in the `ToolMessage`, NOT the file content. Heavy content goes to state; lightweight acknowledgment goes to messages:
+Sub-agents receive a **completely fresh context** containing only their task description. Replace messages entirely before invoking:
 
 ```python
 @tool
-def write_file(
-    file_path: str, content: str,
-    state: Annotated[DeepAgentState, InjectedState],
-    tool_call_id: Annotated[str, InjectedToolCallId],
-) -> Command:
-    files = state.get("files", {})
-    files[file_path] = content
-    return Command(update={
-        "files": files,
-        "messages": [ToolMessage(f"Updated file {file_path}", tool_call_id=tool_call_id)],
-    })
-```
-
-### 3.3 The Orient-Save-Read Workflow
-
-A concrete workflow pattern for agents that need to gather, store, and process information:
-
-1. **Orient**: call `ls()` to see what files already exist before starting work
-2. **Save**: write collected content (user request, search results, intermediate analysis) to files immediately — before context compression can eliminate it
-3. **Read**: when ready to produce output, `read_file` the stored content for precise reference
-
-**Why save early**: for long-running agents, context content can be compressed or dropped by the runtime. Storing information in files before this happens and retrieving when needed is proactive context engineering.
-
-### 3.4 Context Isolation via Sub-Agents
-
-Sub-agents receive a **completely fresh context** containing only their task description. This prevents context clash, confusion, and poisoning from the parent's conversation history.
-
-**The critical line**: replace messages entirely before invoking the sub-agent:
-
-```python
-@tool
-def task(
-    description: str,
-    subagent_type: str,
-    state: Annotated[DeepAgentState, InjectedState],
-    tool_call_id: Annotated[str, InjectedToolCallId],
-):
+def task(description: str, subagent_type: str, state, tool_call_id):
     sub_agent = agents[subagent_type]
-    # Fresh context — sub-agent sees ONLY the task description
     state["messages"] = [{"role": "user", "content": description}]
     result = sub_agent.invoke(state)
     return Command(update={
@@ -565,308 +303,127 @@ def task(
     })
 ```
 
-**Shared state, isolated messages**: the `files` dict is shared (merged back via `file_reducer`), enabling file-based inter-agent communication. But `messages` are replaced, so each sub-agent starts with a clean context. Sub-agents can't see each other's work — provide complete standalone instructions.
+**Shared state, isolated messages**: the `files` dict is shared (merged back via reducer), enabling file-based inter-agent communication. But `messages` are replaced — each sub-agent starts clean.
 
-### 3.5 Content Summarization Pipeline
+### 3.4 Content Summarization Pipeline
 
-When a tool fetches external content (web search, API call), summarize it before it enters the agent's context:
+When a tool fetches external content, summarize it before it enters the agent's context:
 
 ```
 Search query → HTTP fetch → HTML-to-markdown → Structured summarize (cheap model)
   → UUID filename → Write to virtual file → Return minimal summary to agent
 ```
 
-```python
-class Summary(BaseModel):
-    filename: str = Field(description="Name of the file to store.")
-    summary: str = Field(description="Key learnings from the webpage.")
+Key: UUID suffix on filenames prevents collisions. The summarization model is cheap (GPT-4o-mini), not the main reasoning model. Full content goes to the file; only the summary enters messages.
 
-@tool
-def tavily_search(
-    query: str,
-    state: Annotated[DeepAgentState, InjectedState],
-    tool_call_id: Annotated[str, InjectedToolCallId],
-    max_results: Annotated[int, InjectedToolArg] = 1,  # hidden from LLM
-) -> Command:
-    results = run_tavily_search(query, max_results=max_results)
-    files = state.get("files", {})
-    summaries = []
-    for result in results:
-        summary_obj = summarize_webpage_content(result["content"])  # cheap model
-        uid = base64.urlsafe_b64encode(uuid.uuid4().bytes).rstrip(b"=").decode("ascii")[:8]
-        name, ext = os.path.splitext(summary_obj.filename)
-        filename = f"{name}_{uid}{ext}"
-        files[filename] = result["content"]  # full content → file
-        summaries.append(f"- {filename}: {summary_obj.summary}")  # summary → message
-    return Command(update={
-        "files": files,
-        "messages": [ToolMessage("\n".join(summaries), tool_call_id=tool_call_id)],
-    })
-```
+### 3.5 Think Tool (No-Op Forced Reflection)
 
-**Key details:**
-- UUID suffix on filenames prevents collisions across searches
-- `InjectedToolArg` hides config params (not state) from the LLM schema — distinct from `InjectedState`
-- The summarization model is cheap (GPT-4o-mini), not the main reasoning model
-
-### 3.6 Think Tool (No-Op Forced Reflection)
-
-A tool that does nothing computationally — it returns its input unchanged. Its purpose is to force the LLM to produce a structured reasoning step that stays in context as a `ToolMessage`.
+A tool that returns its input unchanged. Forces the LLM to produce a structured reasoning step that persists in context as a `ToolMessage`:
 
 ```python
 @tool(parse_docstring=True)
 def think_tool(reflection: str) -> str:
-    """Tool for strategic reflection on research progress and decision-making.
-
-    Reflection should address:
-    1. Analysis of current findings
-    2. Gap assessment — what's missing
-    3. Quality evaluation — is the evidence sufficient
-    4. Strategic decision — what to do next
-
-    Args:
-        reflection: Your structured reflection.
-    """
+    """Tool for strategic reflection. Reflection should address:
+    1. Analysis of current findings  2. Gap assessment  3. Quality evaluation  4. Next step"""
     return f"Reflection recorded: {reflection}"
 ```
 
-**Why it works**: the LLM produces better decisions when forced to articulate reasoning as a tool call. The detailed docstring guides what to reflect about. The reflection persists in message history as an explicit reasoning checkpoint.
+The LLM produces better decisions when forced to articulate reasoning as a tool call. The detailed docstring guides what to reflect about.
 
-### 3.7 Prompt Caching-Aware Context Design
+### 3.6 Prompt Caching-Aware Context Design
 
-Most LLM providers (Anthropic, OpenAI, Google) support **prompt caching** — reusing the KV-cache of a previously seen prefix to skip recomputation. Cache hits are ~10x cheaper and significantly faster than reprocessing. Agents that make many sequential LLM calls (ReAct loops, multi-turn conversations) benefit enormously, but only if the context is structured to maximize prefix reuse.
+Most providers support **prompt caching** — reusing the KV-cache of a previously seen prefix. Cache hits are ~10x cheaper. Agents benefit enormously, but only if context maximizes prefix reuse.
 
-**How it works (provider-agnostic):** The provider caches the computed representation of a prompt prefix. On subsequent requests, if the prefix matches byte-for-byte, the cached computation is reused. Any change in the prefix invalidates downstream cache.
+**Cache hierarchy:** `tools → system prompt → messages (in order)`. Changes at any level invalidate that level and everything after it.
 
-**Cache hierarchy (Anthropic-specific but conceptually universal):**
-```
-tools → system prompt → messages (in order)
-```
-Changes at any level invalidate that level and all subsequent levels. Changing a tool definition invalidates everything. Changing the system prompt invalidates system + messages. Appending a new message preserves the cache for everything before it.
+**Core principle — append-only context:** Never modify or reorder earlier messages. Only append new ones.
 
-**Core principle — append-only context:**
+**Practical rules:**
+1. **Static content first, dynamic last.** System instructions and tool definitions at the beginning (cached); conversation at the end.
+2. **Don't rewrite history.** For dynamic state (§2.5), inject into the latest user message — system prompt stays static.
+3. **Summarize-and-append, don't replace.** Start a new conversation branch: `[system] + [summary] + [recent messages]`.
+4. **Explicit cache breakpoints** at stability boundaries (end of system prompt/tool definitions).
+5. **Keep tool definitions static.** Disable tools via error responses first (cache-safe); only remove from schema if the LLM ignores the error (cache-breaking fallback).
 
-Never modify or reorder earlier messages. Only append new messages at the end. This maximizes prefix reuse across turns:
+**Provider notes:**
+- **Anthropic**: 1024-4096 token min prefix, up to 4 breakpoints, 5-min TTL, reads = 10% of base price
+- **OpenAI**: Automatic on ≥1024 tokens, fully prefix-based, no extra cost
+- **Google**: Explicit "cached content" objects with configurable TTL
 
-```
-Turn 1: [system] + [user:A]                         → cache miss, write
-Turn 2: [system] + [user:A] + [asst:B] + [user:C]   → cache hit on [system]+[user:A], write new
-Turn 3: [system] + [user:A] + [asst:B] + [user:C] + [asst:D] + [user:E]  → cache hit through [user:C]
-```
+### 3.7 Tool Output Truncation with File Offloading
 
-If turn 2 had reformulated `[user:A]` instead of appending, the entire cache would be invalidated.
+Tool outputs can be arbitrarily large. Truncate automatically and offload the full output to a retrievable location.
 
-**Practical rules for agent builders:**
+**Basic pattern:** output > threshold → truncate + save to temp file + append hint with file path. Automatic (not opt-in), dual threshold (lines AND bytes), retrievable full output.
 
-1. **Static content first, dynamic content last.** Place tool definitions, system instructions, few-shot examples, and reference documents at the beginning. Put the evolving conversation at the end. The static prefix gets cached once and reused across all turns.
+**Smart head+tail truncation:** Blind truncation cuts the most useful part — errors, stack traces, and summaries tend to appear at the **end**.
 
-2. **Don't rewrite history.** Never modify the system prompt or earlier messages between turns. For dynamic state injection (§2.5), put working memory into the latest user message — the system prompt stays static and cached.
+1. Check if tail (~2K chars) contains important content (regex: `error`, `exception`, `traceback`, `panic`, JSON `}`)
+2. If important: head budget + tail budget (min 30% of total, 4KB) + middle omission marker
+3. If not: standard head-only with newline alignment
 
-3. **Summarize-and-append, don't summarize-and-replace.** When context grows too large, summarize older messages with a cheap model and append the summary as a new message. Don't delete the old messages mid-conversation (that invalidates cache). Instead, start a new conversation branch with: `[system] + [summary of prior context] + [recent messages]`.
+**Budget distribution for multi-block results:** Distribute proportionally by block size — a 100-byte block and a 50KB block should not get the same budget.
 
-4. **Use explicit cache breakpoints at stability boundaries.** Mark the end of your static system prompt and tool definitions with a cache breakpoint. This ensures the stable prefix is cached independently from the volatile conversation:
+> See: [OpenClaw](./inspections/openclaw.md) §7.6
 
-```python
-# Anthropic example — explicit breakpoint on system prompt
-response = client.messages.create(
-    model="claude-sonnet-4-6",
-    system=[{
-        "type": "text",
-        "text": SYSTEM_PROMPT + TOOL_INSTRUCTIONS + FEW_SHOT_EXAMPLES,
-        "cache_control": {"type": "ephemeral"},  # breakpoint: cache this independently
-    }],
-    cache_control={"type": "ephemeral"},  # auto-cache conversation tail
-    messages=conversation_history,  # append-only
-)
-```
+### 3.8 Context-Loss Detection & Re-injection
 
-5. **Progressive summarization with cheap models.** When context exceeds a threshold (e.g., 80% of window), summarize the oldest N messages using a cheap model (Haiku, GPT-4o-mini). The summarization prompt should preserve: key decisions made, facts discovered, current plan state, and any file/artifact references. Inject the summary as the first user message in a fresh conversation:
+When the agent writes state to a tool call (TODO list, plan), it scrolls out of the attention window over time. Detect when the original write is no longer in recent context (~last 20 messages) and re-inject a concise reminder as a `HumanMessage`.
 
-```python
-def maybe_compress_context(messages, max_tokens=100_000):
-    token_count = estimate_tokens(messages)
-    if token_count < max_tokens * 0.8:
-        return messages  # no compression needed
+**Design choice — reminder, not full replay:** Inject "You have an active TODO list: ..." rather than replaying the full tool call. Fewer tokens, same effect.
 
-    # Split: old messages to summarize, recent messages to keep verbatim
-    split_point = len(messages) // 2
-    old_messages = messages[:split_point]
-    recent_messages = messages[split_point:]
+### 3.9 Auto-Continue After Context Recovery
 
-    summary = cheap_model.invoke(
-        f"Summarize this conversation preserving: decisions made, "
-        f"facts discovered, current plan, and artifact references.\n\n"
-        f"{format_messages(old_messages)}"
-    )
-
-    return [
-        {"role": "user", "content": f"<context_summary>\n{summary}\n</context_summary>"},
-        {"role": "assistant", "content": "Understood. I have the context from our prior conversation."},
-        *recent_messages,
-    ]
-```
-
-6. **Keep tool definitions static — disable tools via error responses, not schema removal.** Tools sit at the top of the cache hierarchy (`tools → system → messages`). Removing a tool from the `tools` array invalidates the entire prompt cache. Use a two-step escalation instead:
-
-**Step 1 — error stub (cache-safe, handles ~99% of cases):** The tool remains in the schema but returns a structured error when called after a budget/limit is reached. The LLM learns from the error and stops calling it. Reinforce by injecting a "do NOT call tool X" reminder into the latest user message via §2.5 working memory.
-
-**Step 2 — remove tool (cache-breaking fallback):** If the LLM calls the tool *again* despite the error, remove it from the `tools` array on the next turn. This invalidates the cache but prevents an infinite loop. This is a safety net that should rarely trigger.
-
-```python
-@tool
-def web_search(query: str, state: Annotated[dict, InjectedState],
-               tool_call_id: Annotated[str, InjectedToolCallId]):
-    remaining = state.get("search_budget", 3)
-    if remaining <= 0:
-        # Step 1: error stub (cache-safe). Track that we returned an error.
-        return Command(update={
-            "search_exhausted": True,
-            "messages": [ToolMessage(
-                "Search limit reached (3/3 used). You MUST use already collected information.",
-                tool_call_id=tool_call_id,
-            )],
-        })
-    # ... actual search logic ...
-    return Command(update={"search_budget": remaining - 1, ...})
-
-# In the agent node — step 2: remove tool only if LLM ignored the error
-def agent_node(state):
-    tools = ALL_TOOLS
-    if state.get("search_exhausted"):
-        tools = [t for t in tools if t.name != "web_search"]  # cache cost, but prevents loop
-    return model.bind_tools(tools).invoke(state["messages"])
-```
-
-**Provider-specific notes:**
-- **Anthropic**: Min cacheable prefix is 1024-4096 tokens (model-dependent). Up to 4 explicit breakpoints. 5-min TTL (refreshed on hit), optional 1-hour TTL at 2x cost. Cache reads = 10% of base input price.
-- **OpenAI**: Automatic prompt caching on all requests ≥1024 tokens. No explicit breakpoints — caching is fully automatic and prefix-based. No additional cost for cache writes.
-- **Google (Gemini)**: Supports explicit "cached content" objects that persist across requests with configurable TTL.
-
-### 3.8 Tool Output Truncation with File Offloading
-
-Tool outputs (file reads, search results, command output) can be arbitrarily large. Sending them verbatim into the conversation floods the context window. Truncate automatically and offload the full output to a retrievable location.
-
-**Pattern:**
-```
-Tool returns output (any size)
-  │
-  ├─ output ≤ threshold (e.g., 2000 lines / 50KB)?
-  │   YES → return as-is
-  │   NO  → truncate to threshold
-  │         save full output to temp file
-  │         append hint: "[Output truncated. Full output: /tmp/tool_output_abc123.txt]"
-  │         return truncated output + hint
-```
-
-**Key decisions:**
-- **Automatic, not opt-in** — applied by the `Tool.define()` wrapper so every tool gets truncation for free. Tool authors don't think about it.
-- **Dual threshold** — line count AND byte count. Prevents both "10K short lines" and "one 5MB line" from flooding context.
-- **Retrievable full output** — the LLM can read the temp file if it needs more. The hint tells it where to look.
-- **Temp file cleanup** — files expire after a TTL (e.g., 7 days) to prevent disk bloat.
-
-**Why not just summarize?** Summarization loses precision. For code search results, grep output, or error logs, the LLM often needs exact content — just not all of it at once. Truncation + file offloading preserves precision while protecting context.
-
-**Difference from §3.2 (virtual filesystem):** Virtual FS is agent-driven (the agent decides to save). Output truncation is framework-driven (happens automatically at the tool boundary). Both serve context protection, but truncation is a safety net while virtual FS is a strategy.
-
-### 3.9 Context-Loss Detection & Re-injection
-
-When the agent writes state to a tool call (TODO list, plan, configuration), that state exists in the message history. As the conversation grows, the original tool call scrolls out of the effective attention window — the LLM "forgets" its plan even though the data is technically still in messages.
-
-**Pattern — middleware-based detection:**
-```python
-class TodoMiddleware:
-    def before_model(self, state):
-        todos = state.get("todos")
-        if not todos:
-            return None  # no todos to track
-
-        # Check if the original write_todos call is still in recent context
-        messages = state["messages"]
-        has_recent_write = any(
-            getattr(msg, "name", None) == "write_todos"
-            for msg in messages[-20:]  # check last N messages
-        )
-
-        if has_recent_write:
-            return None  # still visible, no action needed
-
-        # Re-inject reminder as a HumanMessage so the LLM re-reads its plan
-        reminder = format_todos_as_reminder(todos)
-        return {"messages": [HumanMessage(content=reminder)]}
-```
-
-**Why this matters:** TODO anchoring (§3.1) works by having the agent rewrite its plan. But if the agent doesn't know it has a plan (because the original `write_todos` call is 50 messages ago), it won't rewrite it. Detection + re-injection closes this gap.
-
-**When to apply:** Any state that the agent manages via tool calls and needs to remember across long conversations — TODO lists, configuration settings, accumulated context. The pattern generalizes beyond TODOs to any "important state that can scroll away."
-
-**Design choice — reminder, not full re-injection:** Inject a concise reminder ("You have an active TODO list: ...") rather than replaying the full tool call. This uses fewer tokens and gives the agent a nudge rather than a verbose replay.
-
-### 3.10 Auto-Continue After Context Recovery
-
-When context compaction is triggered automatically (not by the user), inject a synthetic continuation message so the agent keeps working without manual intervention.
+When context compaction is triggered automatically, inject a synthetic continuation message:
 
 ```
-Agent working on multi-step task:
-  ... tool calls, reasoning, progress ...
-  │
-  ├─ Context overflow detected mid-stream
-  ├─ Compaction triggered → LLM summarizes conversation → summary replaces old messages
-  │
-  ├─ WITHOUT auto-continue:
-  │   Agent stops. User must manually say "continue."
-  │   Breaks flow. User may not notice for minutes.
-  │
-  └─ WITH auto-continue:
-      Inject synthetic user message:
-        "Continue if you have next steps, or stop and ask for
-         clarification if you are unsure how to proceed."
-      Agent resumes work seamlessly.
+"Continue if you have next steps, or stop and ask for
+ clarification if you are unsure how to proceed."
 ```
 
-**Why it matters:** Context compaction is an infrastructure concern — the user shouldn't need to babysit it. The synthetic message gives the agent permission to continue while also providing an escape hatch ("stop if unsure") to prevent runaway behavior after context loss.
+The user shouldn't babysit compaction. The escape hatch ("stop if unsure") prevents runaway behavior after context loss. **Don't** auto-continue when compaction was user-initiated.
 
-**When NOT to auto-continue:** When compaction was user-initiated (they explicitly asked to reset/summarize). In that case, the user likely wants to steer the conversation, not have the agent barrel ahead.
+### 3.10 Periodic Self-Check Injection
 
-### 3.11 Periodic Self-Check Injection (Cognitive Checkpoints)
+System-initiated cognitive checkpoints at fixed intervals (e.g., every 50 rounds), distinct from the agent-initiated think tool (§3.5):
 
-Distinct from the [Think Tool (§3.6)](#36-think-tool-no-op-forced-reflection) which is agent-initiated. Self-check injection is **system-initiated** at fixed intervals, providing resource-aware reflection prompts:
-
-```python
-REMINDER_INTERVAL = 50  # Every 50 rounds
-
-if round_idx > 1 and round_idx % REMINDER_INTERVAL == 0:
-    messages.append({"role": "system", "content": f"""
-[CHECKPOINT {round_idx // REMINDER_INTERVAL} — round {round_idx}/{max_rounds}]
-📊 Context: ~{ctx_tokens} tokens | Cost: ${task_cost:.2f} | Remaining: {max_rounds - round_idx} rounds
-
-⏸️ PAUSE AND REFLECT:
-1. Am I making real progress, or repeating the same actions?
-2. Is my current strategy working? Should I try something different?
-3. Is my context bloated? → call `compact_context` to compress old results.
-4. Have I been stuck on the same sub-problem for many rounds?
-5. Should I just STOP and return my best result so far?
-
-This is not a hard limit — you decide. But be honest with yourself.
-"""})
+```
+[CHECKPOINT — round {n}/{max}]
+Context: ~{tokens} tokens | Cost: ${cost} | Remaining: {remaining} rounds
+PAUSE: Am I making progress? Is my strategy working? Should I stop?
 ```
 
-**Key differences from Think Tool:**
-- **System-injected** at intervals vs agent-initiated on demand
-- **Resource-aware**: includes token count, cost, remaining rounds — gives the agent data for its decision
-- **Non-blocking**: a system message, not a tool call. The agent reads it and decides whether to change course
-- **Soft, not hard**: explicitly says "you decide" — the agent can ignore it if progress is good
+Key differences from think tool: system-injected (not agent-initiated), resource-aware (token/cost/round stats), non-blocking (system message, not tool call), soft ("you decide").
 
-**Why it works:** Long-running ReAct loops often drift into repetitive patterns (doom loops) without the agent noticing. The checkpoint provides a natural breakpoint for metacognition, while the resource stats make the cost of continuing visible. This is cheaper than a dedicated reflection LLM call — it's just a system message that gets processed in the next regular call.
+> Source: [Ouroboros](./inspections/ouroboros.md) — self-check injection
 
-**Combine with:** [Tool Loop Detection (PRODUCTION_PATTERNS §10)](./PRODUCTION_PATTERNS.md#10-tool-loop-detection-pattern-based-not-hard-caps) for pattern-based detection, and `compact_context` tool for LLM-driven context management.
+### 3.11 Identifier Preservation in Compaction
 
-> Source: [Ouroboros](./inspections/ouroboros.md) — `loop.py:_maybe_inject_self_check`
+When compacting conversation history, opaque identifiers must survive verbatim. Summarizers will abbreviate UUIDs, reconstruct file paths, and omit URLs — corrupting them silently.
+
+```
+Before compaction: "Created deployment dep_a1b2c3d4e5f6 in us-east-1-prod"
+After naive compaction: "Created a deployment in production"  ← ID lost
+```
+
+**Pattern:** Inject explicit preservation instructions into the summarization prompt:
+
+```
+CRITICAL: Preserve all opaque identifiers exactly as written —
+UUIDs, resource IDs, file paths, URLs, commit SHAs, hostnames, version numbers.
+```
+
+**Three policies:** `strict` (always preserve, default), `custom` (domain-specific), `off` (casual chat).
+
+**With staged summarization**, identifier instructions must be present in *every* stage — identifiers dropped in a partial summary can't be recovered during merge. Strip `toolResult.details` before summarization to avoid untrusted content injection.
+
+> Source: [OpenClaw](./inspections/openclaw.md) §8.2
 
 ---
 
 ## 4. Prompt Engineering for Agents
 
-### System Prompt Structure (Orchestrators)
+### System Prompt Structure
 
 ```
 1. Role & scope (1-2 sentences)
@@ -877,39 +434,20 @@ This is not a hard limit — you decide. But be honest with yourself.
 6. Output rules (language, format, what NOT to mention)
 ```
 
-### Tool Description Design
+### Tool Descriptions & Structured Output
 
 - Docstring = the LLM's only guide. Be specific about **when** to use the tool, not just what it does.
-- Use `parse_docstring=True` so `Args:` section becomes parameter descriptions.
 - Keep parameter names semantic: `task` not `input`, `context` not `extra`.
-- **Override pattern**: `@tool(description=CONSTANT)` separates the LLM-facing description from the code docstring. The `description` parameter replaces the docstring for the LLM, letting you keep app-specific instructions in a prompts module.
-
-### Structured Output Prompts
-
-When using `with_structured_output` / Pydantic schemas:
-- **Remove** JSON format examples from the prompt — the schema is provided via function calling
-- **Keep** semantic rules: valid values, edge cases, field relationships, dictionaries/mappings
-- **Keep** classification logic and examples that help the LLM decide field values
+- **Override pattern**: `@tool(description=CONSTANT)` separates the LLM-facing description from the code docstring.
+- For structured output with Pydantic: **remove** JSON format examples (schema is provided via function calling), **keep** semantic rules and classification logic.
 
 ### Composite Prompt Assembly
 
-Build system prompts from modular constants, not monolithic strings:
+Build system prompts from modular constants, not monolithic strings. Each module owns its prompt section. Use separator lines and XML tags (`<Task>`, `<Hard Limits>`) for structure.
 
-```python
-INSTRUCTIONS = (
-    "# TODO MANAGEMENT\n" + TODO_USAGE_INSTRUCTIONS
-    + "\n\n" + "=" * 80 + "\n\n"
-    + "# FILE SYSTEM USAGE\n" + FILE_USAGE_INSTRUCTIONS
-    + "\n\n" + "=" * 80 + "\n\n"
-    + "# SUB-AGENT DELEGATION\n" + SUBAGENT_INSTRUCTIONS
-)
-```
+### Delegation Limits & Scaling
 
-Each module owns its prompt section. Separator lines (`===`) visually delineate sections for the LLM. Use XML tags (`<Task>`, `<Instructions>`, `<Hard Limits>`) within sections for further structure.
-
-### Hard Limits in Delegation Prompts
-
-Prevent runaway research loops at the prompt level (complementing `recursion_limit` at the graph level):
+Prevent runaway loops at the prompt level (complementing `recursion_limit` at the graph level):
 
 ```
 <Hard Limits>
@@ -917,23 +455,10 @@ Prevent runaway research loops at the prompt level (complementing `recursion_lim
 - Normal research: 2-3 tool calls max
 - Complex multi-faceted: up to 5 tool calls max
 - STOP when 3+ relevant sources found
-- STOP when last 2 searches return similar information
 </Hard Limits>
 ```
 
-### Scaling Rules for Sub-Agent Delegation
-
-Give the orchestrator concrete guidance on how many sub-agents to spawn:
-
-```
-- Simple fact-finding: 1 sub-agent
-- A-vs-B comparison: 1 sub-agent per element
-- Multi-faceted research: parallel agents for different aspects
-- Each sub-agent stores findings in separate files
-- Max N parallel agents per iteration (to limit cost)
-```
-
-Instruct parallel execution explicitly: *"When you identify multiple independent research directions, make multiple task tool calls in a single response to enable parallel execution."*
+Give the orchestrator concrete scaling guidance: 1 sub-agent for simple tasks, 1 per element for comparisons, parallel agents for multi-faceted research, max N per iteration. Instruct parallel execution explicitly.
 
 ---
 
@@ -945,10 +470,11 @@ Instruct parallel execution explicitly: *"When you identify multiple independent
 - [Anthropic: Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents) — practical patterns from production
 
 ### Architecture Deep-Dives
-- [OpenCode Architecture](./inspections/opencode.md) — agents-as-config, fuzzy edit matching, permission-as-data, prompt-driven planning, batch tool, snapshot/revert
-- [OpenClaw Architecture](./inspections/openclaw.md) — multi-channel agent platform, tool policy pipeline, auth failover, dual-loop, HITL
+- [OpenCode Architecture](./inspections/opencode.md) — agents-as-config, fuzzy edit matching, permission-as-data, prompt-driven planning, batch tool, snapshot/revert, markdown-as-code plugins, event-driven hooks
+- [OpenClaw Architecture](./inspections/openclaw.md) — multi-channel agent platform, tool policy pipeline, auth failover, dual-loop, HITL, subagent registry, context engine
 - [DeerFlow Inspection](./inspections/deer_flow.md) — middleware chain architecture, subagent executor with background pools, memory system with upload scrubbing, post-model guardrails
 - [Ouroboros Inspection](./inspections/ouroboros.md) — self-modifying agent with background consciousness, LLM-controlled model switching, periodic self-check injection, budget drift detection
+- [Claude Code Inspection](./inspections/claude_code.md) — markdown-as-code plugin system (agents, commands, skills, hooks as markdown), event-driven hook interception, multi-agent review pipelines
 
 ### Tutorials
 - [deep-agents-from-scratch](../deep-agents-from-scratch/) — progressive tutorial: TODO anchoring → virtual filesystem → sub-agents → full research agent
