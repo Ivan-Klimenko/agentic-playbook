@@ -254,7 +254,9 @@ No single security layer is sufficient. Stack them:
 
 **Key: validate at build time, enforce at runtime, audit always.** Config validation catches mistakes before the system starts. Tool policies enforce at call time. Audit logging records everything for post-incident analysis.
 
-> See: [code_snippets/sandbox_security.ts](./code_snippets/sandbox_security.ts)
+**OS-level enforcement (NemoClaw approach):** For stronger isolation, enforce security at the kernel level via Landlock (filesystem), seccomp (syscalls), and network namespaces. Declare policies as YAML; the sandbox runtime enforces them. Agent code never sees the enforcement layer — it gets "permission denied" from the OS. Key patterns: split read-only config (auth tokens) from read-write agent state via symlinks; restrict network egress per-binary (only `claude` can reach the API, only `git` can reach GitHub); hot-reload network policies without sandbox restart.
+
+> See: [code_snippets/openclaw/sandbox_security.ts](./code_snippets/openclaw/sandbox_security.ts), [code_snippets/nemoclaw/declarative_policy.yaml](./code_snippets/nemoclaw/declarative_policy.yaml), [inspections/nemoclaw.md](./inspections/nemoclaw.md)
 
 ---
 

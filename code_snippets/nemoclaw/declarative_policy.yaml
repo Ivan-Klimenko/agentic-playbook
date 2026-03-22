@@ -1,0 +1,92 @@
+# NemoClaw Declarative Sandbox Policy
+#
+# Security boundary defined in YAML, enforced at the OS level by Landlock + seccomp.
+# Agent code never sees the enforcement layer — it simply gets "permission denied"
+# for unauthorized operations. Policies can be hot-reloaded without sandbox restart.
+#
+# Key pattern: split read-only / read-write for the same config directory.
+# Gateway config (auth tokens) is immutable; agent state is writable via symlinks.
+#
+# Source: nemoclaw-blueprint/policies/openclaw-sandbox.yaml
+
+version: 1
+
+# --- Filesystem Policy ---
+# Deny by default. Only explicitly listed paths are accessible.
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /app
+    - /etc
+    - /sandbox/.openclaw              # Immutable gateway config — prevents agent
+                                      # from tampering with auth tokens or CORS.
+                                      # Writable state (agents, plugins) lives in
+                                      # /sandbox/.openclaw-data via symlinks.
+  read_write:
+    - /sandbox
+    - /tmp
+    - /sandbox/.openclaw-data         # Writable agent/plugin state
+
+# Landlock best-effort — degrades gracefully on older kernels
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+# --- Network Policy ---
+# Per-service allowlists with binary restrictions.
+# Only specific binaries can reach specific endpoints.
+network_policies:
+  nvidia:
+    name: nvidia
+    endpoints:
+      - host: integrate.api.nvidia.com
+        port: 443
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow: { method: "*", path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/claude }      # Only agent binaries can reach API
+      - { path: /usr/local/bin/openclaw }
+
+  github:
+    name: github
+    endpoints:
+      - host: github.com
+        port: 443
+        access: full
+      - host: api.github.com
+        port: 443
+        access: full
+    binaries:
+      - { path: /usr/bin/gh }                # Only git/gh can reach GitHub
+      - { path: /usr/bin/git }
+
+  # Read-only access — only GET allowed
+  openclaw_docs:
+    name: openclaw_docs
+    endpoints:
+      - host: docs.openclaw.ai
+        port: 443
+        rules:
+          - allow: { method: GET, path: "/**" }
+    binaries:
+      - { path: /usr/local/bin/openclaw }
+
+  # Messaging — pre-allowed so agent can send notifications
+  telegram:
+    name: telegram
+    endpoints:
+      - host: api.telegram.org
+        port: 443
+        rules:
+          - allow: { method: GET, path: "/bot*/**" }
+          - allow: { method: POST, path: "/bot*/**" }

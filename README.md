@@ -103,6 +103,7 @@ Project-level architecture deep-dives and codebase inspections (following [PROJE
 - [deer_flow.md](./inspections/deer_flow.md) — super agent harness with middleware chain, subagent executor, LLM-powered memory (Python, LangGraph)
 - [ouroboros.md](./inspections/ouroboros.md) — self-modifying autonomous agent with background consciousness, multi-worker supervisor, constitutional governance (Python, OpenRouter)
 - [claude_code.md](./inspections/claude_code.md) — Anthropic's agentic CLI with markdown-as-code plugin system, event-driven hooks, multi-agent review pipelines, hierarchical permissions (TypeScript core + Python/Markdown plugins)
+- [nemoclaw.md](./inspections/nemoclaw.md) — NVIDIA's sandboxed agent deployment orchestrator with declarative security policies, snapshot-based state migration, multi-sandbox registry (JS/TS + Python)
 
 ### [code_snippets/](./code_snippets/)
 
@@ -164,6 +165,14 @@ code_snippets/claude_code/       (Python/Markdown)
   permission_model.json     — three-tier settings hierarchy, allow/ask/deny, sandbox isolation
   multi_agent_review.md     — parallel review agents + per-issue validation + confidence filtering
   stop_hook_quality_gate.md — Stop hooks as quality enforcement (test/build/completion gates)
+
+code_snippets/nemoclaw/          (JS/TS/Python/YAML)
+  blueprint_orchestrator.py — cross-language orchestration via structured stdout protocol
+  sandbox_registry.js       — file-based multi-sandbox registry with default cascade
+  declarative_policy.yaml   — Landlock + network policy with binary restrictions and split RO/RW
+  snapshot_migration.ts     — state snapshot with external root tracking and path traversal prevention (C-4)
+  policy_merge.js           — YAML-level policy preset merge with path traversal guard
+  plugin_registration.ts    — minimal plugin pattern (1 command + 1 provider) for agent runtime
 ```
 
 ## Sources
@@ -175,6 +184,7 @@ Patterns are drawn from:
 - Architecture analysis of [DeerFlow](./inspections/deer_flow.md) (super agent harness, LangGraph middleware chain)
 - Architecture analysis of [Ouroboros](./inspections/ouroboros.md) (self-modifying autonomous agent with background consciousness)
 - Architecture analysis of [Claude Code](./inspections/claude_code.md) (Anthropic's agentic CLI with plugin ecosystem)
+- Architecture analysis of [NemoClaw](./inspections/nemoclaw.md) (NVIDIA sandboxed agent deployment orchestrator)
 - [deep-agents-from-scratch](https://github.com/) tutorials (TODO anchoring, virtual FS, context offloading, sub-agents)
 - [Anthropic: Building Effective Agents](https://www.anthropic.com/engineering/building-effective-agents)
 - [LangGraph](https://github.com/langchain-ai/langgraph) docs and patterns
