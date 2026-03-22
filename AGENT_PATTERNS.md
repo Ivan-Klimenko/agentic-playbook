@@ -95,14 +95,19 @@ Key decisions: cooldown per profile (not global), probe cooldowned profiles peri
 
 Give the LLM a structured "working memory" view of accumulated state without relying on it to parse long message histories.
 
-**Where to inject:** into the **latest user message**, not the system prompt. The system prompt should stay static so it remains cached across turns (see §3.7).
+**Where to inject:** as a **separate `HumanMessage` appended after the entire message list**, not into the system prompt. The system prompt should stay static so it remains cached across turns (see §3.7). Do not modify existing messages — append a fresh one.
 
 ```
 System prompt (STATIC — cached once, reused every turn):
   Role definition, tool descriptions, instructions, few-shot examples
 
-Latest user message (DYNAMIC — appended each turn, after cached prefix):
-  <working_memory>
+Conversation messages (HISTORY — grows each turn):
+  [user query, assistant response, tool calls, tool results, ...]
+
+Injected working memory (DYNAMIC — rebuilt and appended each turn):
+  HumanMessage:
+    <surface_info>User is on mobile app</surface_info>
+    <search_budget>Searches done: 2/5. Remaining: 3</search_budget>
     <plan>
       1. [completed] Fetch CFR data for A
       2. [in_progress] Fetch CFR data for B
@@ -110,12 +115,28 @@ Latest user message (DYNAMIC — appended each turn, after cached prefix):
     <active_references>
       metrics_a1b2: CFR data for A (metrics, diff)
     </active_references>
-  </working_memory>
-
-  [actual user query or tool results here]
 ```
 
-Best format: structured text (XML tags, markdown sections). In framework code, inject by prepending to the latest `HumanMessage` content before the LLM call.
+**In LangGraph/LangChain**, this works well: build the injection as a `HumanMessage` with all current context (budget counters, surface info, plan state) and pass it as the last message to the LLM call — `[system] + messages + [injected_memory]`. The injection is **not stored in graph state** — it's ephemeral, rebuilt each node invocation from current state. This keeps history clean and the injection always up-to-date.
+
+```python
+# LangGraph node — build working memory and append at call time
+working_memory_parts = []
+working_memory_parts.append(f"<search_budget>Done: {done}/{max}. Left: {left}</search_budget>")
+if surface_id:
+    working_memory_parts.append(f"<surface_info>{surface_desc}</surface_info>")
+
+injected_memory = HumanMessage(content="\n".join(working_memory_parts))
+
+response = await llm.chat(
+    [system] + list(state["messages"]) + [injected_memory],
+    tools=tools_list,
+)
+# Only the response goes into state — the injected_memory is ephemeral
+return Command(update={"messages": [response]}, goto=...)
+```
+
+Best format: structured text (XML tags, markdown sections). Key: the injected message is ephemeral (not persisted to state), rebuilt from current state each turn, and always occupies the last position where the LLM's attention is strongest.
 
 ### 2.6 Agents-as-Config (No Agent Classes)
 
