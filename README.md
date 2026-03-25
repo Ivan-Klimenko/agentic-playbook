@@ -63,6 +63,15 @@ Multi-agent orchestration topologies — how to wire agents together. Adapted fr
 - **Comparison matrix** — topology, communication style, parallelism, complexity
 - **Pattern composition** — combining topologies at different levels
 
+### [PLANNING_PATTERNS.md](./PLANNING_PATTERNS.md)
+
+Cross-project comparison of planning mechanisms — how agents decide what to do, track progress, and keep humans in the loop.
+
+- **Three concerns** — planning vs tracking vs governance as separate abstractions
+- **7 approaches** — TODO tools, task tools with dependencies, plan mode (file + approval), phased workflows, iterative self-improvement, no-planning (pure reactive), middleware-based (Clarify→Plan→Act)
+- **Comparison matrix** — 13 criteria across all approaches
+- **Decision guidance** — model-quality hedge, layered composition, when to use what
+
 ### [INFRA_PATTERNS.md](./INFRA_PATTERNS.md)
 
 Production infrastructure for agent platforms — extracted from [OpenClaw](./inspections/openclaw.md) (628K-LOC TypeScript).
@@ -158,9 +167,11 @@ code_snippets/ouroboros/         (Python)
   owner_injection.py        — per-task mailbox, mid-run message steering via Drive
   budget_tracking.py        — cost estimation, atomic state, drift detection, category breakdown
 
-code_snippets/claude_code/       (Python/Markdown)
+code_snippets/claude_code/       (Python/Markdown/Bash)
   hook_rule_engine.py       — declarative rule engine with hot-reload, fail-safe hooks, cached regex
   pretool_hook.py           — PreToolUse hook pattern with exit code protocol (0/1/2)
+  security_hook.py          — session-scoped security warnings with show-once semantics, probabilistic cleanup
+  self_referential_loop.sh  — Stop hook loop: same prompt re-fed until completion promise fulfilled
   plugin_system.md          — plugin manifest, command/agent/skill/hook schemas, composition patterns
   permission_model.json     — three-tier settings hierarchy, allow/ask/deny, sandbox isolation
   multi_agent_review.md     — parallel review agents + per-issue validation + confidence filtering

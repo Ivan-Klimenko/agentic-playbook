@@ -2,7 +2,7 @@
 
 A practitioner's reference for building LLM-powered agents. Framework-agnostic principles applicable to any agent system.
 
-> **See also:** [LangGraph Patterns](./LANGGRAPH_PATTERNS.md) | [Production Patterns](./PRODUCTION_PATTERNS.md) | [Anti-Patterns](./ANTI_PATTERNS.md) | [Orchestration Topologies](./ORCHESTRATION_PATTERNS.md) | [Infrastructure](./INFRA_PATTERNS.md)
+> **See also:** [LangGraph Patterns](./LANGGRAPH_PATTERNS.md) | [Production Patterns](./PRODUCTION_PATTERNS.md) | [Anti-Patterns](./ANTI_PATTERNS.md) | [Orchestration Topologies](./ORCHESTRATION_PATTERNS.md) | [Planning & Execution](./PLANNING_PATTERNS.md) | [Infrastructure](./INFRA_PATTERNS.md)
 
 ---
 
@@ -190,6 +190,8 @@ Summarization doesn't need frontier-model reasoning — it's a compression task.
 
 ### 2.10 No-Plan Architecture (Planning via System Prompt)
 
+> For a full taxonomy of 7 planning approaches (TODO tools, task tools, plan mode, phased workflows, iterative loops, no-plan, middleware-based), see [Planning & Execution Patterns](./PLANNING_PATTERNS.md).
+
 Not every agent needs a formal plan-and-execute phase. Delegate planning to the LLM via the system prompt — no plan object, no plan tool, no plan state machine.
 
 **When this works:** Conversational agents (1-5 tool calls), diverse task types, latency-sensitive environments.
@@ -277,6 +279,8 @@ Key design decisions:
 As agent tasks grow longer (~50+ tool calls), **context rot** becomes the primary failure mode: the LLM's attention degrades with distance from the current position, causing mission drift, forgotten objectives, and information loss across multi-agent handoffs ("game of telephone"). These patterns address context management as a first-class concern.
 
 ### 3.1 TODO Lists as Context Anchors
+
+> TODO tools also serve as a lightweight planning mechanism. For the full planning taxonomy, see [Planning & Execution Patterns §2.1](./PLANNING_PATTERNS.md#21-todo-tools--planning-as-emergent-tool-use).
 
 A TODO tool that the agent continuously rewrites to combat context rot.
 
